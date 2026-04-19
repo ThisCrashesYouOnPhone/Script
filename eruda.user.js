@@ -72,7 +72,16 @@
     };
   });
 
-  // 4. Global document click/touch listeners (hijack detection)
+  // 4. history.pushState / replaceState (SPA navigation)
+  ['pushState', 'replaceState'].forEach(method => {
+    const orig = history[method].bind(history);
+    history[method] = function (state, title, url) {
+      saveLog(`history.${method}`, url || '(no url)');
+      return orig(state, title, url);
+    };
+  });
+
+  // 6. Global document click/touch listeners (hijack detection)
   const _addEL = EventTarget.prototype.addEventListener;
   EventTarget.prototype.addEventListener = function (type, fn, opts) {
     if (['click', 'mousedown', 'touchend'].includes(type) && this === document) {
@@ -81,7 +90,7 @@
     return _addEL.call(this, type, fn, opts);
   };
 
-  // 5. Meta-refresh detection & removal
+  // 7. Meta-refresh detection & removal
   new MutationObserver(muts => {
     for (const m of muts) {
       for (const node of m.addedNodes) {
@@ -93,15 +102,44 @@
     }
   }).observe(document.documentElement, { childList: true, subtree: true });
 
+  // 8. Embed mousedown redirect blocker (capture phase, fires before their handler)
+  const EMBED_HOSTS = ['pooembed.eu', 'embedsports.top'];
+  if (EMBED_HOSTS.some(h => location.hostname.includes(h))) {
+    document.addEventListener('mousedown', e => {
+      saveLog('embed-mousedown-blocked', `target: ${e.target.tagName} class="${e.target.className}"`);
+      e.stopImmediatePropagation();
+    }, true);
+  }
+
   // ──────────────────────────────────────────────────────────────────────────
 
+
+  // ─── WINDOW HELPERS (accessible from Eruda console) ──────────────────────
+  window.__getLogs   = getLogs;
+  window.__clearLogs = () => GM_setValue(LOG_KEY, '[]').then(() => console.log('Logs cleared'));
+  window.__copyLogs  = async () => {
+    const logs = await getLogs();
+    const text = logs.map(({ time, url, type, detail }) =>
+      `[${time}] [${type}]\nPage:   ${url}\nDetail: ${detail}`
+    ).join('\n\n────────────────────\n\n');
+    await navigator.clipboard.writeText(text);
+    console.log(`Copied ${logs.length} log(s) to clipboard`);
+  };
+  window.__printLogs = async () => {
+    const logs = await getLogs();
+    logs.forEach(l => console.warn(`[${l.time}] [${l.type}]\n  ${l.url}\n  -> ${l.detail}`));
+  };
+  // ──────────────────────────────────────────────────────────────────────────
 
   // ─── ERUDA + UI (after page load so body exists) ──────────────────────────
   window.addEventListener('load', () => {
 
+    // Only init Eruda on top-level frame, not inside iframes/embeds
+    if (window.self !== window.top) return;
+
     // Load Eruda
     const s = document.createElement('script');
-    s.src = 'https://cdn.jsdelivr.net/npm/eruda';
+    s.src = 'https://cdn.jsdelivr.net/npm/eruda@3.0.1/eruda.min.js';
     s.onload = async () => {
       eruda.init();
       eruda.show();
