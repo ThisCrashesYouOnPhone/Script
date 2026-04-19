@@ -116,14 +116,54 @@
     };
   });
 
-  // 4. history.pushState / replaceState — log only (SPA navigation is legit)
-  ['pushState', 'replaceState'].forEach(method => {
-    const orig = history[method].bind(history);
-    history[method] = function (state, title, url) {
-      saveLog('history.' + method, url || '(no url)');
-      return orig(state, title, url);
-    };
-  });
+  // 4. Hook window.location setter — catches `top.location = url` from child iframes
+  try {
+    const winLocDesc = Object.getOwnPropertyDescriptor(Window.prototype, 'location')
+      || Object.getOwnPropertyDescriptor(window, 'location');
+    if (winLocDesc && winLocDesc.set) {
+      Object.defineProperty(window, 'location', {
+        set(val) {
+          const trusted = isWithinTrustedWindow();
+          const msSince = Date.now() - lastTrustedEventTime;
+          if (!trusted) {
+            saveLog('window.location-blocked-popunder', String(val) + ' | ms-since-gesture: ' + msSince);
+            return;
+          }
+          saveLog('window.location-allowed', String(val));
+          winLocDesc.set.call(this, val);
+        },
+        get: winLocDesc.get,
+        configurable: true
+      });
+    }
+  } catch (e) {}
+
+  // 5. history.pushState / replaceState — block cross-origin replaceState, log pushState
+  const _origPush    = history.pushState.bind(history);
+  const _origReplace = history.replaceState.bind(history);
+
+  history.pushState = function(state, title, url) {
+    saveLog('history.pushState', url || '(no url)');
+    return _origPush(state, title, url);
+  };
+
+  history.replaceState = function(state, title, url) {
+    if (url) {
+      try {
+        const target = new URL(String(url), location.href);
+        if (target.origin !== location.origin) {
+          const trusted = isWithinTrustedWindow();
+          const msSince = Date.now() - lastTrustedEventTime;
+          if (!trusted) {
+            saveLog('history.replaceState-blocked-cross-origin', String(url) + ' | ms-since-gesture: ' + msSince);
+            return;
+          }
+        }
+      } catch(e) {}
+    }
+    saveLog('history.replaceState', url || '(no url)');
+    return _origReplace(state, title, url);
+  };
 
   // 5. addEventListener — log all doc listeners, neutralize redirect handlers on embed domains
   const _addEL = EventTarget.prototype.addEventListener;
