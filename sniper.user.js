@@ -9,7 +9,6 @@
 
 (function() {
 
-  // Only run on embed hosts that carry the actual video player
   const SNIPE_HOSTS = [
     'pooembed.eu',
     'embedsports.top',
@@ -20,24 +19,22 @@
   if (!SNIPE_HOSTS.some(h => location.hostname.includes(h))) return;
 
   // ─── STATE ────────────────────────────────────────────────────────────────
-  let capturedM3u8   = null;
-  let takenOver      = false;
-  let takeoverTimer  = null;
+  let capturedM3u8  = null;
+  let capturedRef   = document.referrer || location.href; // Referer to use
+  let takenOver     = false;
+  let takeoverTimer = null;
   // ──────────────────────────────────────────────────────────────────────────
 
 
   // ─── NETWORK LOGGER ───────────────────────────────────────────────────────
-  // Captures timing, status, and m3u8 playlist content from all XHR/fetch
-  // This is what the iOS network tab can't show us
-  const NET_KEY  = 'orion_net_log';
-  const t0_page  = Date.now();
-  const netLog   = [];
+  const NET_KEY = 'orion_net_log';
+  const t0_page = Date.now();
+  const netLog  = [];
 
   function saveNetEntry(entry) {
     entry.ms_since_load = Date.now() - t0_page;
-    entry.page          = location.href;
+    entry.page = location.href;
     netLog.push(entry);
-    // Persist only interesting entries
     if (entry.flag) {
       GM_getValue(NET_KEY, '[]').then(raw => {
         try {
@@ -54,38 +51,29 @@
     return /\.m3u8|\.mpd|stream|token|key|auth|ad|pop|redirect|click|track/i.test(url);
   }
 
-  // Expose net log helpers to console
-  window.__netLog     = () => netLog;
   window.__netSummary = async () => {
     const saved = JSON.parse(await GM_getValue(NET_KEY, '[]'));
-    console.table(saved.map(e => ({
-      ms:     e.ms_since_load,
-      type:   e.type,
-      status: e.status,
-      url:    e.url?.slice(0, 80)
-    })));
+    console.table(saved.map(e => ({ ms: e.ms_since_load, type: e.type, status: e.status, url: e.url?.slice(0, 80) })));
   };
   window.__copyNet = async () => {
     const saved = JSON.parse(await GM_getValue(NET_KEY, '[]'));
     await navigator.clipboard.writeText(JSON.stringify(saved, null, 2));
-    console.log('Network log copied — ' + saved.length + ' entries');
+    console.log('Net log copied — ' + saved.length + ' entries');
   };
-  window.__clearNet = () => GM_setValue(NET_KEY, '[]').then(() => console.log('Net log cleared'));
+  window.__clearNet = () => GM_setValue(NET_KEY, '[]').then(() => console.log('cleared'));
   // ──────────────────────────────────────────────────────────────────────────
 
 
-  // ─── NETWORK SNIFFERS (run at document-start, before any page JS) ─────────
-
-  // Hook XMLHttpRequest — captures timing + response for m3u8 files
-  const origOpen       = XMLHttpRequest.prototype.open;
-  const origSend       = XMLHttpRequest.prototype.send;
-  const origSetHeader  = XMLHttpRequest.prototype.setRequestHeader;
+  // ─── NETWORK SNIFFERS ─────────────────────────────────────────────────────
+  const origOpen      = XMLHttpRequest.prototype.open;
+  const origSend      = XMLHttpRequest.prototype.send;
+  const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
 
   XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-    this._sUrl     = String(url || '');
-    this._sMethod  = method;
+    this._sUrl    = String(url || '');
+    this._sMethod = method;
+    this._sT0     = Date.now();
     this._sHeaders = {};
-    this._sT0      = Date.now();
     if (/\.m3u8/i.test(this._sUrl)) onM3u8(this._sUrl);
     return origOpen.call(this, method, url, ...rest);
   };
@@ -96,81 +84,40 @@
   };
 
   XMLHttpRequest.prototype.send = function(body) {
-    const url     = this._sUrl || '';
-    const method  = this._sMethod || 'GET';
-    const headers = this._sHeaders || {};
-    const t0      = this._sT0 || Date.now();
-
+    const url = this._sUrl || '', t0 = this._sT0 || Date.now();
     this.addEventListener('loadend', () => {
-      const entry = {
-        type:     'xhr',
-        method,
-        url,
-        status:   this.status,
-        duration: Date.now() - t0,
-        headers,
-        flag:     isNetInteresting(url)
-      };
-      // For m3u8 responses, capture the playlist content — reveals CDN structure
-      if (/\.m3u8/i.test(url) && this.responseText) {
-        entry.m3u8_content = this.responseText.slice(0, 2000); // first 2kb is enough
-      }
+      const entry = { type: 'xhr', method: this._sMethod, url, status: this.status, duration: Date.now() - t0, headers: this._sHeaders, flag: isNetInteresting(url) };
+      if (/\.m3u8/i.test(url) && this.responseText) entry.m3u8_content = this.responseText.slice(0, 2000);
       saveNetEntry(entry);
     });
-
     return origSend.call(this, body);
   };
 
-  // Hook fetch — with timing and interesting-request flagging
   const origFetch = window.fetch;
   window.fetch = function(input, init) {
-    const url    = typeof input === 'string' ? input : (input?.url || '');
-    const method = init?.method || 'GET';
-    const t0     = Date.now();
-
+    const url = typeof input === 'string' ? input : (input?.url || '');
+    const t0 = Date.now();
     if (/\.m3u8/i.test(url)) onM3u8(url);
-
     return origFetch.call(this, input, init).then(res => {
-      const entry = {
-        type:     'fetch',
-        method,
-        url,
-        status:   res.status,
-        duration: Date.now() - t0,
-        flag:     isNetInteresting(url)
-      };
-      // Clone and read m3u8 response bodies
+      const entry = { type: 'fetch', url, status: res.status, duration: Date.now() - t0, flag: isNetInteresting(url) };
       if (/\.m3u8/i.test(url)) {
-        res.clone().text().then(text => {
-          entry.m3u8_content = text.slice(0, 2000);
-          saveNetEntry(entry);
-        }).catch(() => saveNetEntry(entry));
-      } else {
-        saveNetEntry(entry);
-      }
+        res.clone().text().then(text => { entry.m3u8_content = text.slice(0, 2000); saveNetEntry(entry); }).catch(() => saveNetEntry(entry));
+      } else { saveNetEntry(entry); }
       return res;
-    }).catch(err => {
-      saveNetEntry({ type: 'fetch-error', method, url, error: String(err), duration: Date.now() - t0, flag: isNetInteresting(url) });
-      throw err;
-    });
+    }).catch(err => { saveNetEntry({ type: 'fetch-error', url, error: String(err), duration: Date.now() - t0, flag: isNetInteresting(url) }); throw err; });
   };
 
-  // Hook video element src setter — catches when JWPlayer sets src directly
+  // Hook video src setter
   try {
-    const origDesc = Object.getOwnPropertyDescriptor(HTMLVideoElement.prototype, 'src');
-    if (origDesc?.set) {
+    const d = Object.getOwnPropertyDescriptor(HTMLVideoElement.prototype, 'src');
+    if (d?.set) {
       Object.defineProperty(HTMLVideoElement.prototype, 'src', {
-        set(val) {
-          if (typeof val === 'string' && /\.m3u8/i.test(val)) onM3u8(val);
-          return origDesc.set.call(this, val);
-        },
-        get: origDesc.get,
-        configurable: true
+        set(val) { if (/\.m3u8/i.test(String(val))) onM3u8(String(val)); return d.set.call(this, val); },
+        get: d.get, configurable: true
       });
     }
   } catch(e) {}
 
-  // Hook video.load() and src attribute to catch all paths
   const origLoad = HTMLMediaElement.prototype.load;
   HTMLMediaElement.prototype.load = function() {
     if (this.src && /\.m3u8/i.test(this.src)) onM3u8(this.src);
@@ -182,20 +129,13 @@
   // ─── M3U8 DETECTED ────────────────────────────────────────────────────────
   function onM3u8(url) {
     if (takenOver) return;
-
-    // Prefer master playlists — first detection wins unless we can upgrade to master
     const isMaster = !/(index|chunklist|seg|media_\d)/i.test(url.split('/').pop());
     if (!capturedM3u8 || isMaster) {
       capturedM3u8 = url;
-
-      // Tell the parent frame immediately
       try {
-        window.parent.postMessage({ type: 'sniper:url', url: capturedM3u8, host: location.hostname }, '*');
-        window.top.postMessage({ type: 'sniper:url', url: capturedM3u8, host: location.hostname }, '*');
+        window.parent.postMessage({ type: 'sniper:url', url, host: location.hostname, ref: location.href }, '*');
+        window.top.postMessage({ type: 'sniper:url', url, host: location.hostname, ref: location.href }, '*');
       } catch(e) {}
-
-      // Schedule the takeover — give JWPlayer 800ms to fully establish the stream
-      // then nuke everything so no ad timers can fire
       clearTimeout(takeoverTimer);
       takeoverTimer = setTimeout(() => takeover(capturedM3u8), 800);
     }
@@ -203,110 +143,195 @@
   // ──────────────────────────────────────────────────────────────────────────
 
 
-  // ─── TAKEOVER — the nuclear option ────────────────────────────────────────
-  // This runs INSIDE the embed iframe.
-  // It kills JWPlayer, all ad timers, and replaces the page with a clean video.
-  function takeover(m3u8url) {
-    if (takenOver) return;
-    takenOver = true;
+  // ─── PROXY FETCH — the auth fix ───────────────────────────────────────────
+  // The stream requires a Referer header. We fetch the m3u8 ourselves with
+  // the correct Referer, rewrite all segment URLs to absolute paths,
+  // then serve the modified playlist as a Blob URL to the video element.
+  // The video element loads from blob: so CORS/Referer restrictions don't apply.
+  async function fetchM3u8WithAuth(m3u8url, referer) {
+    const res = await origFetch(m3u8url, {
+      headers: {
+        'Referer':        referer,
+        'Origin':         new URL(referer).origin,
+        'User-Agent':     navigator.userAgent,
+      },
+      mode: 'cors',
+      credentials: 'include',
+    });
 
-    // 1. Kill ALL pending timeouts and intervals
-    //    We create a high-numbered timer to find the current max ID, then clear all
-    const maxTimerId = setTimeout(() => {}, 99999);
-    for (let i = 0; i <= maxTimerId; i++) {
-      clearTimeout(i);
-      clearInterval(i);
-    }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
 
-    // 2. Nuke JWPlayer specifically if present
-    try {
-      if (typeof jwplayer === 'function') {
-        jwplayer().stop();
-        jwplayer().remove();
-      }
-    } catch(e) {}
+    const text = await res.text();
 
-    // 3. Build the clean player HTML — minimal, no JS, no event handlers
-    const videoHTML = `
-      <style>
-        * { margin:0; padding:0; box-sizing:border-box; }
-        html, body { width:100%; height:100%; background:#000; overflow:hidden; }
-        video {
-          width:100%;
-          height:100%;
-          object-fit:contain;
-          display:block;
-          background:#000;
-        }
-        #status {
-          position:fixed;
-          top:8px;
-          left:50%;
-          transform:translateX(-50%);
-          background:rgba(0,255,136,0.15);
-          color:#00ff88;
-          font:11px monospace;
-          padding:4px 10px;
-          border-radius:4px;
-          border:1px solid rgba(0,255,136,0.3);
-          pointer-events:none;
-          z-index:999;
-          white-space:nowrap;
-        }
-      </style>
-      <div id="status">▶ Clean stream — no ads</div>
-      <video
-        src="${m3u8url}"
-        controls
-        autoplay
-        playsinline
-        webkit-playsinline
-        preload="auto"
-      ></video>
-    `;
+    // Rewrite relative segment URLs to absolute so the video element can
+    // fetch them directly (it will use the blob: origin, not our proxy)
+    const base = m3u8url.substring(0, m3u8url.lastIndexOf('/') + 1);
+    const rewritten = text.split('\n').map(line => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) return line;
+      // Already absolute
+      if (trimmed.startsWith('http')) return line;
+      // Make absolute
+      return base + trimmed;
+    }).join('\n');
 
-    // 4. Replace the entire body
-    //    This removes ALL existing DOM event listeners in one shot
-    document.open();
-    document.write('<!DOCTYPE html><html><head></head><body>' + videoHTML + '</body></html>');
-    document.close();
-
-    // 5. Wire up the video after takeover
-    const video = document.querySelector('video');
-    if (video) {
-      video.addEventListener('error', (e) => {
-        // If native HLS fails (e.g. needs auth headers), show fallback message
-        const status = document.getElementById('status');
-        if (status) {
-          status.style.background = 'rgba(255,50,50,0.2)';
-          status.style.color = '#ff6666';
-          status.style.borderColor = 'rgba(255,50,50,0.3)';
-          status.textContent = '⚠ Stream requires auth — use Copy URL button on main page';
-        }
-      });
-
-      // iOS: enter native fullscreen
-      video.addEventListener('loadedmetadata', () => {
-        const status = document.getElementById('status');
-        if (status) setTimeout(() => status.style.display = 'none', 3000);
-      });
-    }
-
-    // 6. Hook any future timers to be no-ops (prevent re-injection of ad code)
-    window.setTimeout  = (fn, delay, ...args) => 0;
-    window.setInterval = (fn, delay, ...args) => 0;
-
-    console.log('[SNIPER] Takeover complete. Stream:', m3u8url);
+    const blob = new Blob([rewritten], { type: 'application/vnd.apple.mpegurl' });
+    return URL.createObjectURL(blob);
   }
   // ──────────────────────────────────────────────────────────────────────────
 
 
-  // ─── RESPOND TO PARENT REQUESTS ───────────────────────────────────────────
+  // ─── SEAMLESS TAKEOVER ────────────────────────────────────────────────────
+  async function takeover(m3u8url) {
+    if (takenOver) return;
+    takenOver = true;
+
+    // Kill ALL pending timers
+    const maxId = setTimeout(() => {}, 99999);
+    for (let i = 0; i <= maxId; i++) { clearTimeout(i); clearInterval(i); }
+
+    // Stop JWPlayer if present
+    try { if (typeof jwplayer === 'function') { jwplayer().stop(); jwplayer().remove(); } } catch(e) {}
+
+    // Find the original video container to match its dimensions
+    const origVideo    = document.querySelector('video');
+    const origContainer = origVideo?.parentElement || document.body;
+    const containerRect = origContainer.getBoundingClientRect();
+
+    // Fetch the playlist with auth headers, get a blob URL
+    let playUrl = m3u8url;
+    try {
+      const ref = document.referrer || capturedRef || location.href;
+      playUrl = await fetchM3u8WithAuth(m3u8url, ref);
+    } catch(err) {
+      console.warn('[SNIPER] Proxy fetch failed, trying direct:', err.message);
+      // Fall through — try direct URL anyway, might still work
+    }
+
+    // Build a seamless replacement that matches the page's player container
+    // We don't rewrite the whole page — we surgically replace the player element
+    const wrapper = document.createElement('div');
+    wrapper.style.cssText = `
+      position: absolute;
+      inset: 0;
+      background: #000;
+      z-index: 99999;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    `;
+
+    const video = document.createElement('video');
+    video.src         = playUrl;
+    video.controls    = true;
+    video.autoplay    = true;
+    video.playsInline = true;
+    video.setAttribute('webkit-playsinline', '');
+    video.setAttribute('playsinline', '');
+    video.style.cssText = 'width:100%;height:100%;object-fit:contain;background:#000';
+
+    // Status badge — fades out once playing
+    const badge = document.createElement('div');
+    badge.textContent = '▶ Clean stream';
+    badge.style.cssText = `
+      position: absolute;
+      top: 8px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,255,136,0.15);
+      color: #00ff88;
+      font: 11px monospace;
+      padding: 3px 10px;
+      border-radius: 4px;
+      border: 1px solid rgba(0,255,136,0.3);
+      pointer-events: none;
+      z-index: 1;
+      transition: opacity 0.5s;
+    `;
+
+    video.addEventListener('playing', () => {
+      setTimeout(() => badge.style.opacity = '0', 2000);
+    });
+
+    video.addEventListener('error', async () => {
+      // Blob URL failed — the segments still need auth headers
+      // Try direct URL as fallback
+      if (playUrl !== m3u8url) {
+        console.warn('[SNIPER] Blob playback failed, trying direct URL');
+        video.src = m3u8url;
+        video.load();
+        video.play().catch(() => {});
+      } else {
+        badge.style.background = 'rgba(255,80,80,0.2)';
+        badge.style.color = '#ff6666';
+        badge.style.borderColor = 'rgba(255,80,80,0.3)';
+        badge.textContent = '⚠ Auth required — copy URL below';
+        badge.style.opacity = '1';
+      }
+    });
+
+    // Copy URL button — always available as fallback
+    const copyBtn = document.createElement('button');
+    copyBtn.textContent = '📋';
+    copyBtn.title = 'Copy stream URL';
+    copyBtn.style.cssText = `
+      position: absolute;
+      bottom: 8px;
+      right: 8px;
+      background: rgba(255,255,255,0.1);
+      color: #fff;
+      border: none;
+      width: 32px;
+      height: 32px;
+      border-radius: 6px;
+      font: 14px sans-serif;
+      cursor: pointer;
+      z-index: 1;
+      opacity: 0.4;
+      transition: opacity 0.2s;
+    `;
+    copyBtn.addEventListener('mouseenter', () => copyBtn.style.opacity = '1');
+    copyBtn.addEventListener('mouseleave', () => copyBtn.style.opacity = '0.4');
+    copyBtn.addEventListener('touchstart', () => copyBtn.style.opacity = '1');
+    copyBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(m3u8url).then(() => {
+        copyBtn.textContent = '✅';
+        setTimeout(() => copyBtn.textContent = '📋', 2000);
+      });
+    });
+
+    wrapper.appendChild(video);
+    wrapper.appendChild(badge);
+    wrapper.appendChild(copyBtn);
+
+    // Replace the player container content
+    // Make container relative so our absolute wrapper fills it
+    if (origContainer !== document.body) {
+      origContainer.style.position = 'relative';
+      origContainer.style.overflow = 'hidden';
+      origContainer.innerHTML = '';
+      origContainer.appendChild(wrapper);
+    } else {
+      // Fallback: full page replacement
+      document.body.innerHTML = '';
+      document.body.style.cssText = 'margin:0;padding:0;background:#000;width:100%;height:100%;overflow:hidden';
+      wrapper.style.position = 'fixed';
+      document.body.appendChild(wrapper);
+    }
+
+    // Lock timers — prevent ad code re-injection
+    window.setTimeout  = () => 0;
+    window.setInterval = () => 0;
+
+    console.log('[SNIPER] Takeover complete:', m3u8url);
+  }
+  // ──────────────────────────────────────────────────────────────────────────
+
+
+  // ─── PARENT COMMUNICATION ─────────────────────────────────────────────────
   window.addEventListener('message', e => {
     if (e.data === 'sniper:request_url' && capturedM3u8) {
-      try {
-        e.source.postMessage({ type: 'sniper:url', url: capturedM3u8, host: location.hostname }, '*');
-      } catch(e) {}
+      try { e.source.postMessage({ type: 'sniper:url', url: capturedM3u8, host: location.hostname, ref: location.href }, '*'); } catch(e) {}
     }
   });
   // ──────────────────────────────────────────────────────────────────────────
