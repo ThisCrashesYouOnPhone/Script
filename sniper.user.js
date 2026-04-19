@@ -1,7 +1,6 @@
 // ==UserScript==
 // @name         Orion Stream Sniper
 // @namespace    orion-stack
-// @description  Sniffs the raw HLS m3u8 URL from embed players and offers a clean native player
 // @match        *://*/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -10,8 +9,7 @@
 
 (function() {
 
-  // ─── CONFIG ───────────────────────────────────────────────────────────────
-  // Hosts where we want to sniff and replace the player
+  // Only run on embed hosts that carry the actual video player
   const SNIPE_HOSTS = [
     'pooembed.eu',
     'embedsports.top',
@@ -19,292 +17,298 @@
     'exposestrat.com',
   ];
 
-  const onSnipeHost = SNIPE_HOSTS.some(h => location.hostname.includes(h));
-  if (!onSnipeHost) return; // Only run on embed hosts
-  // ──────────────────────────────────────────────────────────────────────────
-
+  if (!SNIPE_HOSTS.some(h => location.hostname.includes(h))) return;
 
   // ─── STATE ────────────────────────────────────────────────────────────────
-  let capturedM3u8   = null;  // The raw stream URL
-  let capturedM3u8s  = [];    // All sniffed URLs (some pages have multiple qualities)
-  let playerInjected = false;
+  let capturedM3u8   = null;
+  let takenOver      = false;
+  let takeoverTimer  = null;
   // ──────────────────────────────────────────────────────────────────────────
 
 
-  // ─── NETWORK SNIFFERS ─────────────────────────────────────────────────────
-  // Hook XMLHttpRequest — JWPlayer uses XHR to fetch the m3u8 playlist
-  const origOpen = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function(method, url) {
-    if (typeof url === 'string' && url.match(/\.m3u8/i)) {
-      onM3u8Detected(url);
+  // ─── NETWORK LOGGER ───────────────────────────────────────────────────────
+  // Captures timing, status, and m3u8 playlist content from all XHR/fetch
+  // This is what the iOS network tab can't show us
+  const NET_KEY  = 'orion_net_log';
+  const t0_page  = Date.now();
+  const netLog   = [];
+
+  function saveNetEntry(entry) {
+    entry.ms_since_load = Date.now() - t0_page;
+    entry.page          = location.href;
+    netLog.push(entry);
+    // Persist only interesting entries
+    if (entry.flag) {
+      GM_getValue(NET_KEY, '[]').then(raw => {
+        try {
+          const logs = JSON.parse(raw);
+          logs.push(entry);
+          if (logs.length > 100) logs.splice(0, logs.length - 100);
+          GM_setValue(NET_KEY, JSON.stringify(logs));
+        } catch(e) {}
+      }).catch(() => {});
     }
-    return origOpen.apply(this, arguments);
+  }
+
+  function isNetInteresting(url) {
+    return /\.m3u8|\.mpd|stream|token|key|auth|ad|pop|redirect|click|track/i.test(url);
+  }
+
+  // Expose net log helpers to console
+  window.__netLog     = () => netLog;
+  window.__netSummary = async () => {
+    const saved = JSON.parse(await GM_getValue(NET_KEY, '[]'));
+    console.table(saved.map(e => ({
+      ms:     e.ms_since_load,
+      type:   e.type,
+      status: e.status,
+      url:    e.url?.slice(0, 80)
+    })));
+  };
+  window.__copyNet = async () => {
+    const saved = JSON.parse(await GM_getValue(NET_KEY, '[]'));
+    await navigator.clipboard.writeText(JSON.stringify(saved, null, 2));
+    console.log('Network log copied — ' + saved.length + ' entries');
+  };
+  window.__clearNet = () => GM_setValue(NET_KEY, '[]').then(() => console.log('Net log cleared'));
+  // ──────────────────────────────────────────────────────────────────────────
+
+
+  // ─── NETWORK SNIFFERS (run at document-start, before any page JS) ─────────
+
+  // Hook XMLHttpRequest — captures timing + response for m3u8 files
+  const origOpen       = XMLHttpRequest.prototype.open;
+  const origSend       = XMLHttpRequest.prototype.send;
+  const origSetHeader  = XMLHttpRequest.prototype.setRequestHeader;
+
+  XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+    this._sUrl     = String(url || '');
+    this._sMethod  = method;
+    this._sHeaders = {};
+    this._sT0      = Date.now();
+    if (/\.m3u8/i.test(this._sUrl)) onM3u8(this._sUrl);
+    return origOpen.call(this, method, url, ...rest);
   };
 
-  // Hook fetch — some players use fetch instead of XHR
+  XMLHttpRequest.prototype.setRequestHeader = function(name, val) {
+    if (this._sHeaders) this._sHeaders[name] = val;
+    return origSetHeader.call(this, name, val);
+  };
+
+  XMLHttpRequest.prototype.send = function(body) {
+    const url     = this._sUrl || '';
+    const method  = this._sMethod || 'GET';
+    const headers = this._sHeaders || {};
+    const t0      = this._sT0 || Date.now();
+
+    this.addEventListener('loadend', () => {
+      const entry = {
+        type:     'xhr',
+        method,
+        url,
+        status:   this.status,
+        duration: Date.now() - t0,
+        headers,
+        flag:     isNetInteresting(url)
+      };
+      // For m3u8 responses, capture the playlist content — reveals CDN structure
+      if (/\.m3u8/i.test(url) && this.responseText) {
+        entry.m3u8_content = this.responseText.slice(0, 2000); // first 2kb is enough
+      }
+      saveNetEntry(entry);
+    });
+
+    return origSend.call(this, body);
+  };
+
+  // Hook fetch — with timing and interesting-request flagging
   const origFetch = window.fetch;
-  window.fetch = function(url, ...args) {
-    const urlStr = typeof url === 'string' ? url : (url?.url || '');
-    if (urlStr.match(/\.m3u8/i)) {
-      onM3u8Detected(urlStr);
-    }
-    return origFetch.apply(this, arguments);
+  window.fetch = function(input, init) {
+    const url    = typeof input === 'string' ? input : (input?.url || '');
+    const method = init?.method || 'GET';
+    const t0     = Date.now();
+
+    if (/\.m3u8/i.test(url)) onM3u8(url);
+
+    return origFetch.call(this, input, init).then(res => {
+      const entry = {
+        type:     'fetch',
+        method,
+        url,
+        status:   res.status,
+        duration: Date.now() - t0,
+        flag:     isNetInteresting(url)
+      };
+      // Clone and read m3u8 response bodies
+      if (/\.m3u8/i.test(url)) {
+        res.clone().text().then(text => {
+          entry.m3u8_content = text.slice(0, 2000);
+          saveNetEntry(entry);
+        }).catch(() => saveNetEntry(entry));
+      } else {
+        saveNetEntry(entry);
+      }
+      return res;
+    }).catch(err => {
+      saveNetEntry({ type: 'fetch-error', method, url, error: String(err), duration: Date.now() - t0, flag: isNetInteresting(url) });
+      throw err;
+    });
   };
 
-  // Hook the src setter on HTMLVideoElement — catches when JWPlayer sets src directly
-  const origSrcDesc = Object.getOwnPropertyDescriptor(HTMLVideoElement.prototype, 'src');
-  if (origSrcDesc?.set) {
-    Object.defineProperty(HTMLVideoElement.prototype, 'src', {
-      set(val) {
-        if (typeof val === 'string' && val.match(/\.m3u8/i)) {
-          onM3u8Detected(val);
-        }
-        return origSrcDesc.set.call(this, val);
-      },
-      get: origSrcDesc.get,
-      configurable: true
-    });
-  }
+  // Hook video element src setter — catches when JWPlayer sets src directly
+  try {
+    const origDesc = Object.getOwnPropertyDescriptor(HTMLVideoElement.prototype, 'src');
+    if (origDesc?.set) {
+      Object.defineProperty(HTMLVideoElement.prototype, 'src', {
+        set(val) {
+          if (typeof val === 'string' && /\.m3u8/i.test(val)) onM3u8(val);
+          return origDesc.set.call(this, val);
+        },
+        get: origDesc.get,
+        configurable: true
+      });
+    }
+  } catch(e) {}
 
-  // Also hook MediaSource and the source element for completeness
-  const origSrcElDesc = Object.getOwnPropertyDescriptor(HTMLSourceElement.prototype, 'src');
-  if (origSrcElDesc?.set) {
-    Object.defineProperty(HTMLSourceElement.prototype, 'src', {
-      set(val) {
-        if (typeof val === 'string' && val.match(/\.m3u8/i)) {
-          onM3u8Detected(val);
-        }
-        return origSrcElDesc.set.call(this, val);
-      },
-      get: origSrcElDesc.get,
-      configurable: true
-    });
-  }
+  // Hook video.load() and src attribute to catch all paths
+  const origLoad = HTMLMediaElement.prototype.load;
+  HTMLMediaElement.prototype.load = function() {
+    if (this.src && /\.m3u8/i.test(this.src)) onM3u8(this.src);
+    return origLoad.call(this);
+  };
   // ──────────────────────────────────────────────────────────────────────────
 
 
-  // ─── M3U8 DETECTION HANDLER ───────────────────────────────────────────────
-  function onM3u8Detected(url) {
-    // Ignore segment playlists (sub-playlists) — we want the master
-    // Master playlists typically don't have 'index' or segment patterns
-    const isMaster = !url.match(/\/index\.m3u8|\/chunklist|\/media_\d|\/seg\d/i);
-    const isNew    = !capturedM3u8s.includes(url);
+  // ─── M3U8 DETECTED ────────────────────────────────────────────────────────
+  function onM3u8(url) {
+    if (takenOver) return;
 
-    if (isNew) {
-      capturedM3u8s.push(url);
-      console.log('[SNIPER] m3u8 detected:', url, isMaster ? '(master)' : '(segment)');
-    }
-
-    // Prefer master playlists — they contain quality variants
+    // Prefer master playlists — first detection wins unless we can upgrade to master
+    const isMaster = !/(index|chunklist|seg|media_\d)/i.test(url.split('/').pop());
     if (!capturedM3u8 || isMaster) {
       capturedM3u8 = url;
-      // Update the UI button if it's already showing
-      updateSniperButton();
+
+      // Tell the parent frame immediately
+      try {
+        window.parent.postMessage({ type: 'sniper:url', url: capturedM3u8, host: location.hostname }, '*');
+        window.top.postMessage({ type: 'sniper:url', url: capturedM3u8, host: location.hostname }, '*');
+      } catch(e) {}
+
+      // Schedule the takeover — give JWPlayer 800ms to fully establish the stream
+      // then nuke everything so no ad timers can fire
+      clearTimeout(takeoverTimer);
+      takeoverTimer = setTimeout(() => takeover(capturedM3u8), 800);
     }
   }
   // ──────────────────────────────────────────────────────────────────────────
 
 
-  // ─── NATIVE PLAYER INJECTION ──────────────────────────────────────────────
-  function injectNativePlayer(m3u8url) {
-    if (playerInjected) return;
-    playerInjected = true;
+  // ─── TAKEOVER — the nuclear option ────────────────────────────────────────
+  // This runs INSIDE the embed iframe.
+  // It kills JWPlayer, all ad timers, and replaces the page with a clean video.
+  function takeover(m3u8url) {
+    if (takenOver) return;
+    takenOver = true;
 
-    // Create a fullscreen overlay with a native <video> element
-    // iOS WebKit natively supports HLS (.m3u8) — no library needed
-    const overlay = document.createElement('div');
-    overlay.id = 'sniper-player-overlay';
-    overlay.style.cssText = `
-      position: fixed;
-      inset: 0;
-      background: #000;
-      z-index: 2147483646;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-    `;
-
-    // Close button
-    const closeBtn = document.createElement('button');
-    closeBtn.textContent = '✕ Close';
-    closeBtn.style.cssText = `
-      position: absolute;
-      top: 12px;
-      left: 12px;
-      background: rgba(255,255,255,0.15);
-      color: #fff;
-      border: none;
-      padding: 8px 16px;
-      font: 14px monospace;
-      border-radius: 6px;
-      cursor: pointer;
-      z-index: 1;
-    `;
-    closeBtn.addEventListener('click', () => {
-      overlay.remove();
-      playerInjected = false;
-    });
-
-    // Quality selector (if we have multiple m3u8s)
-    let qualitySelector = null;
-    if (capturedM3u8s.length > 1) {
-      qualitySelector = document.createElement('select');
-      qualitySelector.style.cssText = `
-        position: absolute;
-        top: 12px;
-        right: 12px;
-        background: rgba(255,255,255,0.15);
-        color: #fff;
-        border: 1px solid rgba(255,255,255,0.3);
-        padding: 6px 10px;
-        font: 13px monospace;
-        border-radius: 6px;
-        z-index: 1;
-      `;
-      capturedM3u8s.forEach((url, i) => {
-        const opt = document.createElement('option');
-        opt.value = url;
-        const label = url.split('/').pop() || 'Stream ' + (i + 1);
-        opt.textContent = label;
-        if (url === m3u8url) opt.selected = true;
-        qualitySelector.appendChild(opt);
-      });
+    // 1. Kill ALL pending timeouts and intervals
+    //    We create a high-numbered timer to find the current max ID, then clear all
+    const maxTimerId = setTimeout(() => {}, 99999);
+    for (let i = 0; i <= maxTimerId; i++) {
+      clearTimeout(i);
+      clearInterval(i);
     }
 
-    // The video element — this is the clean player
-    const video = document.createElement('video');
-    video.src             = m3u8url;
-    video.controls        = true;
-    video.autoplay        = true;
-    video.playsInline     = true;   // Crucial for iOS — prevents forced fullscreen
-    video.style.cssText   = `
-      width: 100%;
-      height: 100%;
-      object-fit: contain;
-    `;
-
-    // Stream URL display + copy button
-    const urlBar = document.createElement('div');
-    urlBar.style.cssText = `
-      position: absolute;
-      bottom: 12px;
-      left: 12px;
-      right: 12px;
-      display: flex;
-      gap: 8px;
-      align-items: center;
-    `;
-    const urlDisplay = document.createElement('span');
-    urlDisplay.style.cssText = `
-      color: rgba(255,255,255,0.5);
-      font: 10px monospace;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      flex: 1;
-    `;
-    urlDisplay.textContent = m3u8url;
-
-    const copyBtn = document.createElement('button');
-    copyBtn.textContent = '📋 Copy URL';
-    copyBtn.style.cssText = closeBtn.style.cssText + 'position:static;';
-    copyBtn.addEventListener('click', () => {
-      navigator.clipboard.writeText(m3u8url).then(() => {
-        copyBtn.textContent = '✅ Copied!';
-        setTimeout(() => copyBtn.textContent = '📋 Copy URL', 2000);
-      });
-    });
-
-    urlBar.append(urlDisplay, copyBtn);
-
-    overlay.appendChild(closeBtn);
-    if (qualitySelector) {
-      overlay.appendChild(qualitySelector);
-      qualitySelector.addEventListener('change', e => {
-        video.src = e.target.value;
-        urlDisplay.textContent = e.target.value;
-        video.play();
-      });
-    }
-    overlay.appendChild(video);
-    overlay.appendChild(urlBar);
-
-    document.body.appendChild(overlay);
-
-    // iOS: request native fullscreen
-    setTimeout(() => {
-      if (video.webkitEnterFullscreen) {
-        video.webkitEnterFullscreen();
+    // 2. Nuke JWPlayer specifically if present
+    try {
+      if (typeof jwplayer === 'function') {
+        jwplayer().stop();
+        jwplayer().remove();
       }
-    }, 500);
+    } catch(e) {}
+
+    // 3. Build the clean player HTML — minimal, no JS, no event handlers
+    const videoHTML = `
+      <style>
+        * { margin:0; padding:0; box-sizing:border-box; }
+        html, body { width:100%; height:100%; background:#000; overflow:hidden; }
+        video {
+          width:100%;
+          height:100%;
+          object-fit:contain;
+          display:block;
+          background:#000;
+        }
+        #status {
+          position:fixed;
+          top:8px;
+          left:50%;
+          transform:translateX(-50%);
+          background:rgba(0,255,136,0.15);
+          color:#00ff88;
+          font:11px monospace;
+          padding:4px 10px;
+          border-radius:4px;
+          border:1px solid rgba(0,255,136,0.3);
+          pointer-events:none;
+          z-index:999;
+          white-space:nowrap;
+        }
+      </style>
+      <div id="status">▶ Clean stream — no ads</div>
+      <video
+        src="${m3u8url}"
+        controls
+        autoplay
+        playsinline
+        webkit-playsinline
+        preload="auto"
+      ></video>
+    `;
+
+    // 4. Replace the entire body
+    //    This removes ALL existing DOM event listeners in one shot
+    document.open();
+    document.write('<!DOCTYPE html><html><head></head><body>' + videoHTML + '</body></html>');
+    document.close();
+
+    // 5. Wire up the video after takeover
+    const video = document.querySelector('video');
+    if (video) {
+      video.addEventListener('error', (e) => {
+        // If native HLS fails (e.g. needs auth headers), show fallback message
+        const status = document.getElementById('status');
+        if (status) {
+          status.style.background = 'rgba(255,50,50,0.2)';
+          status.style.color = '#ff6666';
+          status.style.borderColor = 'rgba(255,50,50,0.3)';
+          status.textContent = '⚠ Stream requires auth — use Copy URL button on main page';
+        }
+      });
+
+      // iOS: enter native fullscreen
+      video.addEventListener('loadedmetadata', () => {
+        const status = document.getElementById('status');
+        if (status) setTimeout(() => status.style.display = 'none', 3000);
+      });
+    }
+
+    // 6. Hook any future timers to be no-ops (prevent re-injection of ad code)
+    window.setTimeout  = (fn, delay, ...args) => 0;
+    window.setInterval = (fn, delay, ...args) => 0;
+
+    console.log('[SNIPER] Takeover complete. Stream:', m3u8url);
   }
   // ──────────────────────────────────────────────────────────────────────────
 
 
-  // ─── FLOATING SNIPER BUTTON ───────────────────────────────────────────────
-  // Only on top frame — the embed pages are iframes inside streamed.pk
-  // But we still want the button on the embed page itself if opened directly
-  let sniperBtn = null;
-
-  function createSniperButton() {
-    if (sniperBtn) return;
-
-    sniperBtn = document.createElement('button');
-    sniperBtn.id = 'sniper-btn';
-    sniperBtn.textContent = '🎯 Waiting for stream...';
-    sniperBtn.style.cssText = `
-      position: fixed;
-      bottom: 20px;
-      left: 50%;
-      transform: translateX(-50%);
-      z-index: 2147483647;
-      background: #111;
-      color: #888;
-      border: 1px solid #444;
-      padding: 10px 20px;
-      font: 14px monospace;
-      border-radius: 8px;
-      cursor: default;
-      white-space: nowrap;
-      transition: all 0.2s;
-      pointer-events: none;
-    `;
-
-    document.body.appendChild(sniperBtn);
-  }
-
-  function updateSniperButton() {
-    if (!sniperBtn) return;
-
-    if (capturedM3u8) {
-      const short = capturedM3u8.split('/').slice(-2).join('/');
-      sniperBtn.textContent = '▶ Play Clean: ' + short;
-      sniperBtn.style.background = '#0a2a0a';
-      sniperBtn.style.color = '#00ff88';
-      sniperBtn.style.borderColor = '#00ff88';
-      sniperBtn.style.cursor = 'pointer';
-      sniperBtn.style.pointerEvents = 'auto';
-      sniperBtn.onclick = () => injectNativePlayer(capturedM3u8);
-    }
-  }
-
-  // Create the button once the DOM is ready
-  window.addEventListener('DOMContentLoaded', createSniperButton);
-  window.addEventListener('load', () => {
-    if (!sniperBtn) createSniperButton();
-    updateSniperButton();
-  });
-
-  // Also expose to parent frame via postMessage so streamed.pk can show a button too
+  // ─── RESPOND TO PARENT REQUESTS ───────────────────────────────────────────
   window.addEventListener('message', e => {
     if (e.data === 'sniper:request_url' && capturedM3u8) {
-      e.source.postMessage({ type: 'sniper:url', url: capturedM3u8 }, '*');
+      try {
+        e.source.postMessage({ type: 'sniper:url', url: capturedM3u8, host: location.hostname }, '*');
+      } catch(e) {}
     }
   });
-
   // ──────────────────────────────────────────────────────────────────────────
-
-  console.log('[SNIPER] Stream Sniper active on', location.hostname);
 
 })();
