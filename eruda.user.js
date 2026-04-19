@@ -10,13 +10,16 @@
 (function () {
 
   // ─── CONFIG ───────────────────────────────────────────────────────────────
-  const LOG_KEY     = 'orion_intercept_logs';
-  const MAX_LOGS    = 200;
-  const BLOCK_OPENS = true; // set false to allow window.open but still log it
+  const LOG_KEY           = 'orion_intercept_logs';
+  const MAX_LOGS          = 200;
+  const BLOCK_OPENS       = true;
+  const EMBED_HOSTS       = ['pooembed.eu', 'embedsports.top'];
+  const REDIRECT_FN_NAMES = ['_0x22571e', '_0x291a5d'];
+  const onEmbedHost       = EMBED_HOSTS.some(h => location.hostname.includes(h));
   // ──────────────────────────────────────────────────────────────────────────
 
 
-  // ─── STORAGE (GM_ gives cross-origin persistence) ─────────────────────────
+  // ─── STORAGE ──────────────────────────────────────────────────────────────
   async function getLogs() {
     try {
       const raw = await GM_getValue(LOG_KEY, '[]');
@@ -38,7 +41,7 @@
   // ──────────────────────────────────────────────────────────────────────────
 
 
-  // ─── INTERCEPT HOOKS (run-at document-start, before page JS) ──────────────
+  // ─── INTERCEPT HOOKS ──────────────────────────────────────────────────────
 
   // 1. window.open
   const _open = window.open.bind(window);
@@ -67,7 +70,7 @@
   ['replace', 'assign'].forEach(method => {
     const orig = location[method].bind(location);
     location[method] = function (url) {
-      saveLog(`location.${method}`, url);
+      saveLog('location.' + method, url);
       return orig(url);
     };
   });
@@ -76,21 +79,36 @@
   ['pushState', 'replaceState'].forEach(method => {
     const orig = history[method].bind(history);
     history[method] = function (state, title, url) {
-      saveLog(`history.${method}`, url || '(no url)');
+      saveLog('history.' + method, url || '(no url)');
       return orig(state, title, url);
     };
   });
 
-  // 6. Global document click/touch listeners (hijack detection)
+  // 5. addEventListener — log all doc listeners, neutralize redirect handlers on embed domains
   const _addEL = EventTarget.prototype.addEventListener;
   EventTarget.prototype.addEventListener = function (type, fn, opts) {
-    if (['click', 'mousedown', 'touchend'].includes(type) && this === document) {
-      saveLog('doc-listener', `type="${type}" fn=${fn?.name || 'anonymous'}`);
+    const name = fn?.name || 'anonymous';
+
+    // On embed domains: silently drop known obfuscated redirect handlers before they register
+    if (onEmbedHost && ['click', 'mousedown'].includes(type) && REDIRECT_FN_NAMES.includes(name)) {
+      saveLog('embed-handler-neutralized', 'type="' + type + '" fn=' + name);
+      return;
     }
+
+    // On embed domains: drop anonymous mousedown on document (fn=anonymous redirect pattern)
+    if (onEmbedHost && type === 'mousedown' && name === 'anonymous' && this === document) {
+      saveLog('embed-anon-mousedown-dropped', 'target: document');
+      return;
+    }
+
+    if (['click', 'mousedown', 'touchend'].includes(type) && this === document) {
+      saveLog('doc-listener', 'type="' + type + '" fn=' + name);
+    }
+
     return _addEL.call(this, type, fn, opts);
   };
 
-  // 7. Meta-refresh detection & removal
+  // 6. Meta-refresh detection & removal
   new MutationObserver(muts => {
     for (const m of muts) {
       for (const node of m.addedNodes) {
@@ -102,12 +120,15 @@
     }
   }).observe(document.documentElement, { childList: true, subtree: true });
 
-  // 8. Embed mousedown redirect blocker (capture phase, fires before their handler)
-  const EMBED_HOSTS = ['pooembed.eu', 'embedsports.top'];
-  if (EMBED_HOSTS.some(h => location.hostname.includes(h))) {
+  // 7. On embed domains: block mousedown on anchors only — leaves JWPlayer controls untouched
+  if (onEmbedHost) {
     document.addEventListener('mousedown', e => {
-      saveLog('embed-mousedown-blocked', `target: ${e.target.tagName} class="${e.target.className}"`);
-      e.stopImmediatePropagation();
+      const anchor = e.target.closest('a');
+      if (anchor) {
+        saveLog('embed-anchor-mousedown-blocked', 'href=' + anchor.href);
+        e.stopImmediatePropagation();
+        e.preventDefault();
+      }
     }, true);
   }
 
@@ -120,18 +141,19 @@
   window.__copyLogs  = async () => {
     const logs = await getLogs();
     const text = logs.map(({ time, url, type, detail }) =>
-      `[${time}] [${type}]\nPage:   ${url}\nDetail: ${detail}`
-    ).join('\n\n────────────────────\n\n');
+      '[' + time + '] [' + type + ']\nPage:   ' + url + '\nDetail: ' + detail
+    ).join('\n\n--------------------\n\n');
     await navigator.clipboard.writeText(text);
-    console.log(`Copied ${logs.length} log(s) to clipboard`);
+    console.log('Copied ' + logs.length + ' log(s) to clipboard');
   };
   window.__printLogs = async () => {
     const logs = await getLogs();
-    logs.forEach(l => console.warn(`[${l.time}] [${l.type}]\n  ${l.url}\n  -> ${l.detail}`));
+    logs.forEach(l => console.warn('[' + l.time + '] [' + l.type + ']\n  ' + l.url + '\n  -> ' + l.detail));
   };
   // ──────────────────────────────────────────────────────────────────────────
 
-  // ─── ERUDA + UI (after page load so body exists) ──────────────────────────
+
+  // ─── ERUDA + UI ───────────────────────────────────────────────────────────
   window.addEventListener('load', () => {
 
     // Only init Eruda on top-level frame, not inside iframes/embeds
@@ -148,88 +170,71 @@
       // Replay persisted logs
       const logs = await getLogs();
       if (logs.length) {
-        ec.log(`%c── Restored ${logs.length} log(s) from previous pages ──`, 'color:#888');
+        ec.log('%c-- Restored ' + logs.length + ' log(s) from previous pages --', 'color:#888');
         logs.forEach(({ time, url, type, detail }) => {
-          ec.warn(`[${time}] [${type}]\n  page: ${url}\n  detail: ${detail}`);
+          ec.warn('[' + time + '] [' + type + ']\n  page: ' + url + '\n  detail: ' + detail);
         });
-        ec.log('%c── Current page ──', 'color:#888');
+        ec.log('%c-- Current page --', 'color:#888');
       }
 
-      // Pipe future saveLog calls into Eruda live
-      const _origSave = saveLog;
       window.__interceptLog = async (type, detail) => {
         await saveLog(type, detail);
-        ec.warn(`[LIVE][${type}] ${detail}`);
+        ec.warn('[LIVE][' + type + '] ' + detail);
       };
     };
     document.body.appendChild(s);
 
 
-    // ── Floating button bar ────────────────────────────────────────────────
+    // ── Floating button bar ──────────────────────────────────────────────────
     const bar = document.createElement('div');
-    bar.style.cssText = `
-      position: fixed;
-      top: 12px;
-      right: 12px;
-      z-index: 2147483647;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    `;
+    bar.style.cssText = [
+      'position:fixed', 'top:12px', 'right:12px', 'z-index:2147483647',
+      'display:flex', 'flex-direction:column', 'gap:6px'
+    ].join(';');
 
     function makeBtn(emoji, label, onClick) {
       const b = document.createElement('button');
-      b.innerHTML = `${emoji} ${label}`;
-      b.style.cssText = `
-        background: #1a1a1a;
-        color: #00ff88;
-        border: 1px solid #00ff88;
-        padding: 8px 12px;
-        font: 12px monospace;
-        border-radius: 6px;
-        cursor: pointer;
-        white-space: nowrap;
-        -webkit-tap-highlight-color: transparent;
-      `;
-      b.addEventListener('click', async () => {
-        await onClick(b);
-      });
+      b.innerHTML = emoji + ' ' + label;
+      b.style.cssText = [
+        'background:#1a1a1a', 'color:#00ff88', 'border:1px solid #00ff88',
+        'padding:8px 12px', 'font:12px monospace', 'border-radius:6px',
+        'cursor:pointer', 'white-space:nowrap', '-webkit-tap-highlight-color:transparent'
+      ].join(';');
+      b.addEventListener('click', async () => { await onClick(b); });
       return b;
     }
 
-    // Copy button
     const copyBtn = makeBtn('📋', 'Copy Logs', async (b) => {
       const logs = await getLogs();
-      if (!logs.length) { b.innerHTML = '⚠️ No logs'; setTimeout(() => b.innerHTML = '📋 Copy Logs', 2000); return; }
-
+      if (!logs.length) {
+        b.innerHTML = '⚠️ No logs';
+        setTimeout(() => b.innerHTML = '📋 Copy Logs', 2000);
+        return;
+      }
       const text = logs.map(({ time, url, type, detail }) =>
-        `[${time}] [${type}]\nPage:   ${url}\nDetail: ${detail}`
-      ).join('\n\n────────────────────\n\n');
-
+        '[' + time + '] [' + type + ']\nPage:   ' + url + '\nDetail: ' + detail
+      ).join('\n\n--------------------\n\n');
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(text);
         b.innerHTML = '✅ Copied!';
       } else {
-        // Fallback: open in new tab as selectable plain text
         const w = _open();
-        w.document.write(`<pre style="font:13px monospace;padding:16px">${text}</pre>`);
+        w.document.write('<pre style="font:13px monospace;padding:16px">' + text + '</pre>');
       }
       setTimeout(() => b.innerHTML = '📋 Copy Logs', 2000);
     });
 
-    // Export as JSON button
     const jsonBtn = makeBtn('📤', 'Export JSON', async (b) => {
       const logs = await getLogs();
       const blob = new Blob([JSON.stringify(logs, null, 2)], { type: 'application/json' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = `orion-logs-${Date.now()}.json`;
+      a.download = 'orion-logs-' + Date.now() + '.json';
       a.click();
       b.innerHTML = '✅ Exported!';
       setTimeout(() => b.innerHTML = '📤 Export JSON', 2000);
     });
 
-    // Clear button
     const clearBtn = makeBtn('🗑', 'Clear Logs', async (b) => {
       await GM_setValue(LOG_KEY, '[]');
       b.innerHTML = '✅ Cleared';
@@ -240,7 +245,7 @@
     bar.appendChild(jsonBtn);
     bar.appendChild(clearBtn);
     document.body.appendChild(bar);
-    // ──────────────────────────────────────────────────────────────────────
+    // ────────────────────────────────────────────────────────────────────────
   });
   // ──────────────────────────────────────────────────────────────────────────
 
