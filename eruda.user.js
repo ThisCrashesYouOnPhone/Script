@@ -11,27 +11,40 @@
 
   // ─── CONFIG ───────────────────────────────────────────────────────────────
   const LOG_KEY           = 'orion_intercept_logs';
-  const MAX_LOGS          = 200;
+  const MAX_LOGS          = 300;
   const BLOCK_OPENS       = true;
-  const TRUSTED_EVENT_TTL = 600;   // ms — window after a real tap where navigation is allowed
-  const SHIELD_DURATION   = 2500;  // ms — how long to hold beforeunload after blocking anything
-  const EMBED_HOSTS       = ['pooembed.eu', 'embedsports.top', 'boomerang-bet.com', 'bonusandspins.com'];
-  const REDIRECT_FN_NAMES = ['_0x22571e', '_0x291a5d', 's'];
-  const onEmbedHost       = EMBED_HOSTS.some(h => location.hostname.includes(h));
+  const TRUSTED_EVENT_TTL = 600;
+
+  // Known embed/ad host patterns — anything matching these gets full neutralization
+  const EMBED_HOST_PATTERNS = [
+    'pooembed.eu',
+    'embedsports.top',
+    'embedhd.org',
+    'exposestrat.com',
+    'onandasmilee.com',
+    'top-toones.com',
+    'boomerang-bet.com',
+    'bonusandspins.com',
+    'togglevpn.app',
+    'adcash.com',
+    'appsflyer.com',
+  ];
+
+  // Specific known redirect handler names (fallback for non-_0x patterns)
+  const REDIRECT_FN_NAMES = ['s', 'io'];
+
+  const onEmbedHost = EMBED_HOST_PATTERNS.some(h => location.hostname.includes(h));
+
+  // Pattern test — the real weapon: catches ALL obfuscated handlers regardless of rotation
+  const isObfuscatedFn = name => /^_0x[0-9a-f]+$/i.test(name);
   // ──────────────────────────────────────────────────────────────────────────
 
 
-  // ─── STORAGE (sync-safe via queue) ────────────────────────────────────────
-  // GM_setValue is async — queue writes so rapid blocks don't race each other
+  // ─── STORAGE (queued writes — prevents async race on rapid blocks) ─────────
   let _logQueue = Promise.resolve();
-
   async function getLogs() {
-    try {
-      const raw = await GM_getValue(LOG_KEY, '[]');
-      return JSON.parse(raw);
-    } catch { return []; }
+    try { return JSON.parse(await GM_getValue(LOG_KEY, '[]')); } catch { return []; }
   }
-
   function saveLog(type, detail) {
     _logQueue = _logQueue.then(async () => {
       try {
@@ -46,59 +59,14 @@
   // ──────────────────────────────────────────────────────────────────────────
 
 
-  // ─── REDIRECT SHIELD (beforeunload) ───────────────────────────────────────
-  // When we block anything, arm this for SHIELD_DURATION ms.
-  // It intercepts beforeunload which catches ALL navigation mechanisms —
-  // including ones that bypass our location/open hooks entirely.
-  const Shield = {
-    active: false,
-    timer: null,
-    handler(e) {
-      e.preventDefault();
-      e.returnValue = '';
-      saveLog('shield-blocked-navigation', location.href);
-      return '';
-    },
-    arm() {
-      if (!this.active) {
-        this.boundHandler = this.handler.bind(this);
-        window.addEventListener('beforeunload', this.boundHandler, true);
-        this.active = true;
-      }
-      // Reset timer each time something new is blocked
-      clearTimeout(this.timer);
-      this.timer = setTimeout(() => this.disarm(), SHIELD_DURATION);
-    },
-    disarm() {
-      if (!this.active) return;
-      window.removeEventListener('beforeunload', this.boundHandler, true);
-      this.active = false;
-      this.timer = null;
-    }
-  };
-
-  function blockAndShield(logType, detail) {
-    saveLog(logType, detail);
-    Shield.arm();
-  }
-  // ──────────────────────────────────────────────────────────────────────────
-
-
   // ─── TRUSTED INTERACTION TRACKER ──────────────────────────────────────────
   let lastTrustedEventTime = 0;
-
   function recordTrustedEvent(evt) {
-    if (evt && evt.isTrusted) {
-      lastTrustedEventTime = Date.now();
-      // Any real user interaction disarms the shield so navigation works normally
-      Shield.disarm();
-    }
+    if (evt && evt.isTrusted) lastTrustedEventTime = Date.now();
   }
-
   function isWithinTrustedWindow() {
     return (Date.now() - lastTrustedEventTime) < TRUSTED_EVENT_TTL;
   }
-
   ['click', 'mousedown', 'touchstart', 'touchend'].forEach(type => {
     document.addEventListener(type, recordTrustedEvent, { capture: true, passive: true });
   });
@@ -110,10 +78,8 @@
   // 1. window.open
   const _open = window.open.bind(window);
   window.open = function (url, ...args) {
-    const trusted = isWithinTrustedWindow();
-    const msSince = Date.now() - lastTrustedEventTime;
-    if (!trusted) {
-      blockAndShield('window.open-blocked', (url || '(no url)') + ' | ms-since-gesture: ' + msSince);
+    if (!isWithinTrustedWindow()) {
+      saveLog('window.open-blocked', (url || '(no url)') + ' | ms: ' + (Date.now() - lastTrustedEventTime));
       return null;
     }
     saveLog('window.open-allowed', url || '(no url)');
@@ -124,187 +90,195 @@
   try {
     const origDesc = Object.getOwnPropertyDescriptor(window.location, 'href')
       || Object.getOwnPropertyDescriptor(Location.prototype, 'href');
-    if (origDesc && origDesc.set) {
+    if (origDesc?.set) {
       Object.defineProperty(window.location, 'href', {
         set(val) {
-          const trusted = isWithinTrustedWindow();
-          const msSince = Date.now() - lastTrustedEventTime;
-          if (!trusted) {
-            blockAndShield('location.href-blocked', String(val) + ' | ms-since-gesture: ' + msSince);
-            return;
-          }
+          if (!isWithinTrustedWindow()) { saveLog('location.href-blocked', String(val)); return; }
           saveLog('location.href-allowed', val);
           origDesc.set.call(window.location, val);
         },
-        get: origDesc.get,
-        configurable: true
+        get: origDesc.get, configurable: true
       });
     }
-  } catch (e) {}
+  } catch(e) {}
 
-  // 3. location.replace / location.assign
+  // 3. location.replace / assign
   ['replace', 'assign'].forEach(method => {
     const orig = location[method].bind(location);
     location[method] = function (url) {
-      const trusted = isWithinTrustedWindow();
-      const msSince = Date.now() - lastTrustedEventTime;
-      if (!trusted) {
-        blockAndShield('location.' + method + '-blocked', String(url) + ' | ms-since-gesture: ' + msSince);
-        return;
-      }
+      if (!isWithinTrustedWindow()) { saveLog('location.' + method + '-blocked', String(url)); return; }
       saveLog('location.' + method + '-allowed', url);
       return orig(url);
     };
   });
 
-  // 4. window.location property setter (catches top.location = url from child iframes)
+  // 4. window.location setter — catches top.location = url from child iframes
   try {
-    const winLocDesc = Object.getOwnPropertyDescriptor(Window.prototype, 'location')
+    const d = Object.getOwnPropertyDescriptor(Window.prototype, 'location')
       || Object.getOwnPropertyDescriptor(window, 'location');
-    if (winLocDesc && winLocDesc.set) {
+    if (d?.set) {
       Object.defineProperty(window, 'location', {
         set(val) {
-          const trusted = isWithinTrustedWindow();
-          const msSince = Date.now() - lastTrustedEventTime;
-          if (!trusted) {
-            blockAndShield('window.location-blocked', String(val) + ' | ms-since-gesture: ' + msSince);
-            return;
-          }
-          saveLog('window.location-allowed', String(val));
-          winLocDesc.set.call(this, val);
+          if (!isWithinTrustedWindow()) { saveLog('window.location-blocked', String(val)); return; }
+          d.set.call(this, val);
         },
-        get: winLocDesc.get,
-        configurable: true
+        get: d.get, configurable: true
       });
     }
-  } catch (e) {}
+  } catch(e) {}
 
-  // 5. history.pushState / replaceState — block cross-origin replaceState
+  // 5. history.pushState / replaceState
   const _origPush    = history.pushState.bind(history);
   const _origReplace = history.replaceState.bind(history);
-
-  history.pushState = function(state, title, url) {
+  history.pushState = function(s, t, url) {
     saveLog('history.pushState', url || '(no url)');
-    return _origPush(state, title, url);
+    return _origPush(s, t, url);
   };
-
-  history.replaceState = function(state, title, url) {
+  history.replaceState = function(s, t, url) {
     if (url) {
       try {
-        const target = new URL(String(url), location.href);
-        if (target.origin !== location.origin) {
-          const trusted = isWithinTrustedWindow();
-          const msSince = Date.now() - lastTrustedEventTime;
-          if (!trusted) {
-            blockAndShield('history.replaceState-blocked-cross-origin', String(url) + ' | ms-since-gesture: ' + msSince);
-            return;
-          }
+        if (new URL(String(url), location.href).origin !== location.origin && !isWithinTrustedWindow()) {
+          saveLog('history.replaceState-cross-origin-blocked', String(url));
+          return;
         }
       } catch(e) {}
     }
     saveLog('history.replaceState', url || '(no url)');
-    return _origReplace(state, title, url);
+    return _origReplace(s, t, url);
   };
 
-  // 6. addEventListener — log doc listeners, neutralize redirect handlers on embed domains
+  // 6. addEventListener — THE KEY WEAPON: pattern-match ALL _0x handlers on embed hosts
   const _addEL = EventTarget.prototype.addEventListener;
   EventTarget.prototype.addEventListener = function (type, fn, opts) {
     const name = fn?.name || 'anonymous';
+    const isRedirectType = ['click', 'mousedown', 'touchend'].includes(type);
 
-    if (onEmbedHost && ['click', 'mousedown'].includes(type) && REDIRECT_FN_NAMES.includes(name)) {
-      saveLog('embed-handler-neutralized', 'type="' + type + '" fn=' + name);
-      return;
+    if (onEmbedHost && isRedirectType) {
+      // Block ALL obfuscated _0x handlers — catches new ones automatically
+      if (isObfuscatedFn(name)) {
+        saveLog('embed-obfuscated-neutralized', 'type="' + type + '" fn=' + name);
+        return;
+      }
+      // Block specific known redirect names
+      if (REDIRECT_FN_NAMES.includes(name)) {
+        saveLog('embed-handler-neutralized', 'type="' + type + '" fn=' + name);
+        return;
+      }
+      // Block anonymous mousedown on document
+      if (type === 'mousedown' && name === 'anonymous' && this === document) {
+        saveLog('embed-anon-mousedown-dropped', 'target: document');
+        return;
+      }
     }
 
-    if (onEmbedHost && type === 'mousedown' && name === 'anonymous' && this === document) {
-      saveLog('embed-anon-mousedown-dropped', 'target: document');
-      return;
-    }
-
-    if (['click', 'mousedown', 'touchend'].includes(type) && this === document) {
+    if (isRedirectType && this === document) {
       saveLog('doc-listener', 'type="' + type + '" fn=' + name);
     }
 
     return _addEL.call(this, type, fn, opts);
   };
 
-  // 7. Meta-refresh detection & removal
-  new MutationObserver(muts => {
-    for (const m of muts) {
-      for (const node of m.addedNodes) {
-        if (node.tagName === 'META' && node.httpEquiv?.toLowerCase() === 'refresh') {
-          blockAndShield('meta-refresh-blocked', node.content);
-          node.remove();
-        }
-      }
-    }
-  }).observe(document.documentElement, { childList: true, subtree: true });
-
-  // 8. On embed domains: block mousedown on anchors, leave JWPlayer controls untouched
-  if (onEmbedHost) {
-    document.addEventListener('mousedown', e => {
-      const anchor = e.target.closest('a');
-      if (anchor) {
-        blockAndShield('embed-anchor-mousedown-blocked', 'href=' + anchor.href);
-        e.stopImmediatePropagation();
-        e.preventDefault();
-      }
-    }, true);
-  }
-
-  // 9. Intercept ALL click events — catches programmatic .click() on hidden anchor elements
-  // This is the primary vector for sports-on-couch, shein, etc. style redirects
+  // 7. Anchor click interception — catches programmatic .click() on hidden ad anchors
   document.addEventListener('click', e => {
     const anchor = e.target.closest('a');
     if (!anchor) return;
-
     const href = anchor.href || '';
-    const isBlank = anchor.target === '_blank' || anchor.target === '_top' || anchor.target === '_parent';
-    const isExternal = href && !href.startsWith(location.origin) && !href.startsWith('javascript:') && !href.startsWith('#');
-
-    // Block untrusted (programmatic) clicks on external/blank links
-    if (!e.isTrusted && (isBlank || isExternal)) {
-      blockAndShield('anchor-click-blocked-untrusted', href);
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      return;
-    }
-
-    // Block ANY click (trusted or not) on anchor during shield period if we just blocked something
-    if (Shield.active && isExternal && !isWithinTrustedWindow()) {
-      blockAndShield('anchor-click-blocked-shield', href);
+    const isExternal = href && !href.startsWith(location.origin) && !/^(javascript|#|data):/.test(href);
+    const isBlankOrTop = ['_blank','_top','_parent'].includes(anchor.target);
+    if (!e.isTrusted && (isExternal || isBlankOrTop)) {
+      saveLog('anchor-click-blocked-untrusted', href);
       e.preventDefault();
       e.stopImmediatePropagation();
     }
   }, true);
 
-  // 10. Hook HTMLElement.click() — catches el.click() on anchors which bypasses event listeners
+  // 8. HTMLElement.click() hook — catches el.click() calls that bypass event listeners
   const _origClick = HTMLElement.prototype.click;
   HTMLElement.prototype.click = function() {
-    const anchor = this.closest ? this.closest('a') : null;
+    const anchor = this.closest?.('a');
     if (anchor) {
       const href = anchor.href || '';
-      const isExternal = href && !href.startsWith(location.origin) && !href.startsWith('javascript:') && !href.startsWith('#');
+      const isExternal = href && !href.startsWith(location.origin) && !/^(javascript|#|data):/.test(href);
       if (isExternal && !isWithinTrustedWindow()) {
-        blockAndShield('el.click-blocked', href);
+        saveLog('el.click-blocked', href);
         return;
       }
     }
     return _origClick.call(this);
   };
 
-  // 11. Hook HTMLFormElement.submit — catches form-based popup redirects
+  // 9. Form submit hook
   const _origSubmit = HTMLFormElement.prototype.submit;
   HTMLFormElement.prototype.submit = function() {
-    if (this.target === '_blank' || this.target === '_top') {
-      const url = this.action || location.href;
-      if (!isWithinTrustedWindow()) {
-        blockAndShield('form.submit-blocked', url);
-        return;
-      }
+    if (['_blank','_top'].includes(this.target) && !isWithinTrustedWindow()) {
+      saveLog('form.submit-blocked', this.action || location.href);
+      return;
     }
     return _origSubmit.call(this);
   };
+
+  // 10. Meta-refresh removal
+  new MutationObserver(muts => {
+    for (const m of muts) for (const node of m.addedNodes) {
+      if (node.tagName === 'META' && node.httpEquiv?.toLowerCase() === 'refresh') {
+        saveLog('meta-refresh-blocked', node.content);
+        node.remove();
+      }
+    }
+  }).observe(document.documentElement, { childList: true, subtree: true });
+
+  // 11. IFRAME SANDBOX INJECTION — the nuclear option
+  // Strips allow-top-navigation from all iframes, preventing ANY iframe from
+  // navigating the parent page at the browser level — no JS hook can bypass this.
+  // We preserve allow-scripts, allow-same-origin, allow-forms, allow-presentation
+  // so video players continue working.
+  const SAFE_SANDBOX = 'allow-scripts allow-same-origin allow-forms allow-presentation allow-popups';
+
+  function sandboxIframe(iframe) {
+    // Don't re-sandbox or touch same-origin iframes (they're trusted)
+    try {
+      if (iframe.contentWindow?.location?.origin === location.origin) return;
+    } catch(e) {} // cross-origin throws — that's fine, we want to sandbox those
+
+    const existing = iframe.getAttribute('sandbox');
+    if (existing !== null) {
+      // Already sandboxed — just strip top-navigation if present
+      const cleaned = existing
+        .replace(/allow-top-navigation(-by-user-activation)?/gi, '')
+        .trim();
+      if (cleaned !== existing) {
+        iframe.setAttribute('sandbox', cleaned);
+        saveLog('iframe-sandbox-stripped-top-nav', iframe.src || '(no src)');
+      }
+    } else {
+      // No sandbox — add one that blocks top navigation
+      iframe.setAttribute('sandbox', SAFE_SANDBOX);
+      saveLog('iframe-sandboxed', iframe.src || '(no src)');
+    }
+  }
+
+  // Apply to iframes as they're added
+  new MutationObserver(muts => {
+    for (const m of muts) for (const node of m.addedNodes) {
+      if (node.tagName === 'IFRAME') sandboxIframe(node);
+      else if (node.querySelectorAll) node.querySelectorAll('iframe').forEach(sandboxIframe);
+    }
+  }).observe(document.documentElement, { childList: true, subtree: true });
+
+  // Apply to any iframes already in the page
+  document.querySelectorAll?.('iframe').forEach(sandboxIframe);
+
+  // 12. Embed-domain anchor mousedown block (refined)
+  if (onEmbedHost) {
+    document.addEventListener('mousedown', e => {
+      const anchor = e.target.closest('a');
+      if (anchor) {
+        saveLog('embed-anchor-mousedown-blocked', 'href=' + anchor.href);
+        e.stopImmediatePropagation();
+        e.preventDefault();
+      }
+    }, true);
+  }
 
   // ──────────────────────────────────────────────────────────────────────────
 
@@ -324,7 +298,12 @@
     const logs = await getLogs();
     logs.forEach(l => console.warn('[' + l.time + '] [' + l.type + ']\n  ' + l.url + '\n  -> ' + l.detail));
   };
-  window.__shieldStatus = () => console.log('Shield active:', Shield.active, '| ms since trusted gesture:', Date.now() - lastTrustedEventTime);
+  window.__stats = async () => {
+    const logs = await getLogs();
+    const counts = {};
+    logs.forEach(l => { counts[l.type] = (counts[l.type] || 0) + 1; });
+    console.table(counts);
+  };
   // ──────────────────────────────────────────────────────────────────────────
 
 
@@ -338,7 +317,6 @@
       eruda.init();
       eruda.show();
       const ec = eruda.get('console');
-
       const logs = await getLogs();
       if (logs.length) {
         ec.log('%c-- Restored ' + logs.length + ' log(s) --', 'color:#888');
@@ -350,53 +328,34 @@
     };
     document.body.appendChild(s);
 
-    // Floating buttons
     const bar = document.createElement('div');
     bar.style.cssText = 'position:fixed;top:12px;right:12px;z-index:2147483647;display:flex;flex-direction:column;gap:6px';
-
-    function makeBtn(emoji, label, onClick) {
+    function makeBtn(emoji, label, fn) {
       const b = document.createElement('button');
       b.innerHTML = emoji + ' ' + label;
-      b.style.cssText = 'background:#1a1a1a;color:#00ff88;border:1px solid #00ff88;padding:8px 12px;font:12px monospace;border-radius:6px;cursor:pointer;white-space:nowrap;-webkit-tap-highlight-color:transparent';
-      b.addEventListener('click', async () => { await onClick(b); });
+      b.style.cssText = 'background:#1a1a1a;color:#00ff88;border:1px solid #00ff88;padding:8px 12px;font:12px monospace;border-radius:6px;cursor:pointer;white-space:nowrap';
+      b.addEventListener('click', async () => fn(b));
       return b;
     }
-
-    const copyBtn = makeBtn('📋', 'Copy Logs', async (b) => {
+    bar.appendChild(makeBtn('📋', 'Copy', async b => {
       const logs = await getLogs();
-      if (!logs.length) { b.innerHTML = '⚠️ No logs'; setTimeout(() => b.innerHTML = '📋 Copy Logs', 2000); return; }
-      const text = logs.map(({ time, url, type, detail }) =>
-        '[' + time + '] [' + type + ']\nPage:   ' + url + '\nDetail: ' + detail
-      ).join('\n\n--------------------\n\n');
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-        b.innerHTML = '✅ Copied!';
-      }
-      setTimeout(() => b.innerHTML = '📋 Copy Logs', 2000);
-    });
-
-    const jsonBtn = makeBtn('📤', 'Export JSON', async (b) => {
+      const text = logs.map(({ time, url, type, detail }) => '[' + time + '] [' + type + ']\nPage:   ' + url + '\nDetail: ' + detail).join('\n\n--------------------\n\n');
+      await navigator.clipboard.writeText(text).catch(() => {});
+      b.innerHTML = '✅'; setTimeout(() => b.innerHTML = '📋 Copy', 2000);
+    }));
+    bar.appendChild(makeBtn('📤', 'JSON', async b => {
       const logs = await getLogs();
-      const blob = new Blob([JSON.stringify(logs, null, 2)], { type: 'application/json' });
       const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
+      a.href = URL.createObjectURL(new Blob([JSON.stringify(logs, null, 2)], { type: 'application/json' }));
       a.download = 'orion-logs-' + Date.now() + '.json';
       a.click();
-      b.innerHTML = '✅ Exported!';
-      setTimeout(() => b.innerHTML = '📤 Export JSON', 2000);
-    });
-
-    const clearBtn = makeBtn('🗑', 'Clear Logs', async (b) => {
+      b.innerHTML = '✅'; setTimeout(() => b.innerHTML = '📤 JSON', 2000);
+    }));
+    bar.appendChild(makeBtn('🗑', 'Clear', async b => {
       await GM_setValue(LOG_KEY, '[]');
-      b.innerHTML = '✅ Cleared';
-      setTimeout(() => b.innerHTML = '🗑 Clear Logs', 2000);
-    });
-
-    bar.appendChild(copyBtn);
-    bar.appendChild(jsonBtn);
-    bar.appendChild(clearBtn);
+      b.innerHTML = '✅'; setTimeout(() => b.innerHTML = '🗑 Clear', 2000);
+    }));
     document.body.appendChild(bar);
   });
-  // ──────────────────────────────────────────────────────────────────────────
 
 })();
