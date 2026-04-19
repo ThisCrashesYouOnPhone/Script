@@ -13,9 +13,32 @@
   const LOG_KEY           = 'orion_intercept_logs';
   const MAX_LOGS          = 200;
   const BLOCK_OPENS       = true;
-  const EMBED_HOSTS       = ['pooembed.eu', 'embedsports.top'];
-  const REDIRECT_FN_NAMES = ['_0x22571e', '_0x291a5d'];
+  const TRUSTED_EVENT_TTL = 600;   // ms — window after a real user tap where navigation is allowed
+  const EMBED_HOSTS       = ['pooembed.eu', 'embedsports.top', 'boomerang-bet.com', 'bonusandspins.com'];
+  const REDIRECT_FN_NAMES = ['_0x22571e', '_0x291a5d', 's'];
   const onEmbedHost       = EMBED_HOSTS.some(h => location.hostname.includes(h));
+  // ──────────────────────────────────────────────────────────────────────────
+
+
+  // ─── TRUSTED INTERACTION TRACKER ──────────────────────────────────────────
+  // Records timestamp of the last genuine isTrusted user gesture.
+  // Any navigation/open call that fires outside TRUSTED_EVENT_TTL is a popunder.
+  let lastTrustedEventTime = 0;
+
+  function recordTrustedEvent(evt) {
+    if (evt && evt.isTrusted) {
+      lastTrustedEventTime = Date.now();
+    }
+  }
+
+  function isWithinTrustedWindow() {
+    return (Date.now() - lastTrustedEventTime) < TRUSTED_EVENT_TTL;
+  }
+
+  // Listen in capture phase so we always see events before page JS
+  ['click', 'mousedown', 'touchstart', 'touchend'].forEach(type => {
+    document.addEventListener(type, recordTrustedEvent, { capture: true, passive: true });
+  });
   // ──────────────────────────────────────────────────────────────────────────
 
 
@@ -43,21 +66,33 @@
 
   // ─── INTERCEPT HOOKS ──────────────────────────────────────────────────────
 
-  // 1. window.open
+  // 1. window.open — block if untrusted or outside trusted window
   const _open = window.open.bind(window);
   window.open = function (url, ...args) {
-    saveLog('window.open', url || '(no url)');
+    const trusted  = isWithinTrustedWindow();
+    const msSince  = Date.now() - lastTrustedEventTime;
+    if (!trusted) {
+      saveLog('window.open-blocked-popunder', (url || '(no url)') + ' | ms-since-gesture: ' + msSince);
+      return null;
+    }
+    saveLog('window.open-allowed', url || '(no url)');
     return BLOCK_OPENS ? null : _open(url, ...args);
   };
 
-  // 2. location.href setter
+  // 2. location.href setter — block if outside trusted window
   try {
     const origDesc = Object.getOwnPropertyDescriptor(window.location, 'href')
       || Object.getOwnPropertyDescriptor(Location.prototype, 'href');
     if (origDesc && origDesc.set) {
       Object.defineProperty(window.location, 'href', {
         set(val) {
-          saveLog('location.href', val);
+          const trusted = isWithinTrustedWindow();
+          const msSince = Date.now() - lastTrustedEventTime;
+          if (!trusted) {
+            saveLog('location.href-blocked-popunder', String(val) + ' | ms-since-gesture: ' + msSince);
+            return;
+          }
+          saveLog('location.href-allowed', val);
           origDesc.set.call(window.location, val);
         },
         get: origDesc.get,
@@ -66,16 +101,22 @@
     }
   } catch (e) {}
 
-  // 3. location.replace / location.assign
+  // 3. location.replace / location.assign — block if outside trusted window
   ['replace', 'assign'].forEach(method => {
     const orig = location[method].bind(location);
     location[method] = function (url) {
-      saveLog('location.' + method, url);
+      const trusted = isWithinTrustedWindow();
+      const msSince = Date.now() - lastTrustedEventTime;
+      if (!trusted) {
+        saveLog('location.' + method + '-blocked-popunder', String(url) + ' | ms-since-gesture: ' + msSince);
+        return;
+      }
+      saveLog('location.' + method + '-allowed', url);
       return orig(url);
     };
   });
 
-  // 4. history.pushState / replaceState (SPA navigation)
+  // 4. history.pushState / replaceState — log only (SPA navigation is legit)
   ['pushState', 'replaceState'].forEach(method => {
     const orig = history[method].bind(history);
     history[method] = function (state, title, url) {
@@ -149,6 +190,10 @@
   window.__printLogs = async () => {
     const logs = await getLogs();
     logs.forEach(l => console.warn('[' + l.time + '] [' + l.type + ']\n  ' + l.url + '\n  -> ' + l.detail));
+  };
+  window.__trustedAge = () => {
+    const ms = Date.now() - lastTrustedEventTime;
+    console.log('ms since last trusted gesture: ' + ms + ' (window: ' + TRUSTED_EVENT_TTL + 'ms)');
   };
   // ──────────────────────────────────────────────────────────────────────────
 
