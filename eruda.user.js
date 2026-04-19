@@ -359,3 +359,72 @@
   });
 
 })();
+
+  // ─── STREAM SNIPER BRIDGE (parent frame only) ─────────────────────────────
+  // Listens for m3u8 URLs from embed iframes running the sniper script,
+  // then shows a "Play Clean" button on the streamed.pk page itself.
+  if (window.self === window.top) {
+    let sniperUrl = null;
+
+    window.addEventListener('message', e => {
+      if (e.data?.type === 'sniper:url' && e.data?.url) {
+        sniperUrl = e.data.url;
+        showParentSniperButton(sniperUrl);
+      }
+    });
+
+    // Poll embed iframes for stream URLs every second
+    setInterval(() => {
+      document.querySelectorAll('iframe').forEach(iframe => {
+        try {
+          iframe.contentWindow?.postMessage('sniper:request_url', '*');
+        } catch(e) {}
+      });
+    }, 1000);
+
+    function showParentSniperButton(url) {
+      let btn = document.getElementById('parent-sniper-btn');
+      if (!btn) {
+        btn = document.createElement('button');
+        btn.id = 'parent-sniper-btn';
+        btn.style.cssText = `
+          position: fixed;
+          bottom: 20px;
+          left: 50%;
+          transform: translateX(-50%);
+          z-index: 2147483647;
+          background: #0a2a0a;
+          color: #00ff88;
+          border: 1px solid #00ff88;
+          padding: 12px 24px;
+          font: 15px monospace;
+          border-radius: 8px;
+          cursor: pointer;
+          white-space: nowrap;
+          box-shadow: 0 0 20px rgba(0,255,136,0.3);
+        `;
+        document.body?.appendChild(btn);
+      }
+      const short = url.split('/').slice(-2).join('/');
+      btn.textContent = '▶ Play Clean — ' + short;
+      btn.onclick = () => {
+        const video = document.createElement('video');
+        video.src = url;
+        video.controls = true;
+        video.autoplay = true;
+        video.playsInline = true;
+        video.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;background:#000;z-index:2147483646;object-fit:contain';
+
+        const closeBtn = document.createElement('button');
+        closeBtn.textContent = '✕';
+        closeBtn.style.cssText = 'position:fixed;top:12px;left:12px;z-index:2147483647;background:rgba(0,0,0,0.7);color:#fff;border:none;padding:8px 14px;font:16px monospace;border-radius:6px;cursor:pointer';
+        closeBtn.onclick = () => { video.remove(); closeBtn.remove(); };
+
+        document.body.appendChild(video);
+        document.body.appendChild(closeBtn);
+
+        if (video.webkitEnterFullscreen) setTimeout(() => video.webkitEnterFullscreen(), 300);
+      };
+    }
+  }
+  // ──────────────────────────────────────────────────────────────────────────
