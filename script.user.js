@@ -8,7 +8,7 @@
 // @match        *://*/*
 // @run-at       document-start
 // @grant        none
-// @version      1.5
+// @version      1.6
 // @updateURL    https://raw.githubusercontent.com/ThisCrashesYouOnPhone/Script/main/script.user.js
 // @downloadURL  https://raw.githubusercontent.com/ThisCrashesYouOnPhone/Script/main/script.user.js
 // ==/UserScript==
@@ -16,9 +16,9 @@
 (function () {
   'use strict';
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // -------------------------------------------------------------------------
   // STATE
-  // ─────────────────────────────────────────────────────────────────────────
+  // -------------------------------------------------------------------------
 
   // Stores every m3u8/mpd URL the page requests, keyed by hostname
   const sniffedURLs = new Map();
@@ -37,10 +37,10 @@
   const _origSetAttribute  = Element.prototype.setAttribute;
   const _origRemoveAttribute = Element.prototype.removeAttribute;
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // MODULE 1 — NETWORK INTERCEPTOR
+  // -------------------------------------------------------------------------
+  // MODULE 1 - NETWORK INTERCEPTOR
   // Proxy XHR + fetch at document-start to sniff .m3u8 / .mpd stream URLs
-  // ─────────────────────────────────────────────────────────────────────────
+  // -------------------------------------------------------------------------
 
   function isStreamURL(url) {
     if (!url) return false;
@@ -52,7 +52,7 @@
       
       const path = new URL(decoded, location.href).pathname;
       return /\.(m3u8|mpd)$/i.test(path) || /\.(m3u8|mpd)(?:\?|$)/i.test(decoded);
-    } catch {
+    } catch (e) {
       return /\.(m3u8|mpd)(?:\?|$)/i.test(url);
     }
   }
@@ -66,7 +66,7 @@
 
     // Broadcast across frames via postMessage to mesh all iframe sniffers together
     try {
-      const msg = { type: 'ap-sniffed-url', url };
+      const msg = { type: 'ap-sniffed-url', url: url };
       if (window.parent && window.parent !== window) {
         window.parent.postMessage(msg, '*');
       }
@@ -87,28 +87,30 @@
     }
   }
 
-  // Proxy XMLHttpRequest
-  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-    if (url) storeStreamURL(String(url));
-    return _origXHROpen.call(this, method, url, ...rest);
+  // Proxy XMLHttpRequest - ES5 compliant apply logic
+  XMLHttpRequest.prototype.open = function () {
+    if (arguments[1]) storeStreamURL(String(arguments[1]));
+    return _origXHROpen.apply(this, arguments);
   };
 
-  // Proxy fetch
+  // Proxy fetch - ES5 compliant apply logic
   if (_origFetch) {
-    window.fetch = function (resource, ...args) {
+    window.fetch = function () {
+      const resource = arguments[0];
       const url = resource instanceof Request ? resource.url : String(resource);
       storeStreamURL(url);
-      return _origFetch(resource, ...args);
+      return _origFetch.apply(this, arguments);
     };
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // MODULE 2 — DOM CREATION & SHADOW DOM INTERCEPTORS
+  // -------------------------------------------------------------------------
+  // MODULE 2 - DOM CREATION & SHADOW DOM INTERCEPTORS
   // Hooks createElement, attachShadow, setAttribute, and removeAttribute.
-  // ─────────────────────────────────────────────────────────────────────────
+  // -------------------------------------------------------------------------
 
-  document.createElement = function (tag, ...args) {
-    const el = _origCreateElement(tag, ...args);
+  document.createElement = function () {
+    const el = _origCreateElement.apply(document, arguments);
+    const tag = arguments[0];
     if (typeof tag === 'string' && tag.toLowerCase() === 'video') {
       el.setAttribute('x-webkit-airplay', 'allow');
       el.setAttribute('airplay', 'allow');
@@ -123,7 +125,7 @@
       if (shadow) {
         observeRoot(shadow);
         // Process any videos that might immediately be placed in the shadow root
-        setTimeout(() => {
+        setTimeout(function () {
           findAllVideos(shadow).forEach(processVideo);
         }, 0);
       }
@@ -178,19 +180,19 @@
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // MODULE 3 — HLS SOURCE INJECTION (fixes MSE / audio-only problem)
-  // ─────────────────────────────────────────────────────────────────────────
+  // -------------------------------------------------------------------------
+  // MODULE 3 - HLS SOURCE INJECTION (fixes MSE / audio-only problem)
+  // -------------------------------------------------------------------------
 
   function getBestSniffedURL() {
     const list = sniffedURLs.get(location.hostname);
     if (!list || list.length === 0) return null;
     
     // Strictly prefer master/playlist files over segments and mpd if both sniffed
-    const preferred = list.find(u =>
-      /\.m3u8/i.test(u) && /master|playlist|index/i.test(u)
-    );
-    return preferred || list.find(u => /\.m3u8/i.test(u)) || list[list.length - 1];
+    const preferred = list.find(function (u) {
+      return /\.m3u8/i.test(u) && /master|playlist|index/i.test(u);
+    });
+    return preferred || list.find(function (u) { return /\.m3u8/i.test(u); }) || list[list.length - 1];
   }
 
   function isMSEVideo(video) {
@@ -223,9 +225,9 @@
     return true;
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // MODULE 4 — CLONE + REINSERT (fixes post-render attribute problem)
-  // ─────────────────────────────────────────────────────────────────────────
+  // -------------------------------------------------------------------------
+  // MODULE 4 - CLONE + REINSERT (fixes post-render attribute problem)
+  // -------------------------------------------------------------------------
 
   function cloneAndReinsert(video) {
     if (!video.parentNode) return video;
@@ -249,15 +251,15 @@
     clone.volume       = volume;
     clone.playbackRate = playbackRate;
     if (!wasPaused) {
-      clone.play().catch(() => {});
+      clone.play().catch(function () {});
     }
 
     return clone;
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // MODULE 5 — AIRPLAY BUTTON OVERLAY (Premium Glassmorphism Style)
-  // ─────────────────────────────────────────────────────────────────────────
+  // -------------------------------------------------------------------------
+  // MODULE 5 - AIRPLAY BUTTON OVERLAY (Premium Glassmorphism Style)
+  // -------------------------------------------------------------------------
 
   function injectAirPlayButton(video) {
     if (typeof video.webkitShowPlaybackTargetPicker !== 'function') return;
@@ -273,73 +275,44 @@
     const btn = _origCreateElement('button');
     btn.className = 'ap-btn-injected';
     btn.title     = 'AirPlay video';
-    btn.innerHTML = `
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
-           stroke="currentColor" stroke-width="2.5" stroke-linecap="round"
-           stroke-linejoin="round">
-        <path d="M5 17H3a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h18a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-2"/>
-        <polygon points="12 15 17 21 7 21 12 15"/>
-      </svg>
-    `;
+    btn.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 17H3a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h18a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-2"/><polygon points="12 15 17 21 7 21 12 15"/></svg>';
     
-    btn.style.cssText = `
-      position: absolute;
-      bottom: 16px;
-      right: 16px;
-      z-index: 2147483647;
-      width: 38px;
-      height: 38px;
-      background: rgba(18, 18, 18, 0.65);
-      color: #ffffff;
-      border: 1px solid rgba(255, 255, 255, 0.15);
-      border-radius: 50%;
-      cursor: pointer;
-      display: none;
-      align-items: center;
-      justify-content: center;
-      backdrop-filter: blur(12px);
-      -webkit-backdrop-filter: blur(12px);
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-      line-height: 0;
-      outline: none;
-      pointer-events: auto !important;
-    `;
+    btn.style.cssText = 'position: absolute; bottom: 16px; right: 16px; z-index: 2147483647; width: 38px; height: 38px; background: rgba(18, 18, 18, 0.65); color: #ffffff; border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 50%; cursor: pointer; display: none; align-items: center; justify-content: center; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3); transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); line-height: 0; outline: none; pointer-events: auto !important;';
 
-    btn.addEventListener('mouseenter', () => {
+    btn.addEventListener('mouseenter', function () {
       btn.style.transform = 'scale(1.08)';
       btn.style.background = 'rgba(30, 30, 30, 0.8)';
       btn.style.borderColor = 'rgba(255, 255, 255, 0.3)';
     });
-    btn.addEventListener('mouseleave', () => {
+    btn.addEventListener('mouseleave', function () {
       btn.style.transform = 'scale(1)';
       btn.style.background = 'rgba(18, 18, 18, 0.65)';
       btn.style.borderColor = 'rgba(255, 255, 255, 0.15)';
     });
-    btn.addEventListener('mousedown', () => {
+    btn.addEventListener('mousedown', function () {
       btn.style.transform = 'scale(0.95)';
     });
-    btn.addEventListener('mouseup', () => {
+    btn.addEventListener('mouseup', function () {
       btn.style.transform = 'scale(1.08)';
     });
 
-    btn.addEventListener('click', (e) => {
+    btn.addEventListener('click', function (e) {
       e.stopPropagation();
       e.preventDefault();
       video.webkitShowPlaybackTargetPicker();
     });
 
-    const show = () => (btn.style.display = 'flex');
-    const hide = () => (btn.style.display = 'none');
+    const show = function () { btn.style.display = 'flex'; };
+    const hide = function () { btn.style.display = 'none'; };
 
     video.addEventListener('mouseenter', show);
     video.addEventListener('mouseleave', hide);
-    video.addEventListener('touchstart', () => {
+    video.addEventListener('touchstart', function () {
       show();
       setTimeout(hide, 3500);
     }, { passive: true });
 
-    video.addEventListener('webkitplaybacktargetavailabilitychanged', (e) => {
+    video.addEventListener('webkitplaybacktargetavailabilitychanged', function (e) {
       if (e.availability === 'available') {
         show();
       } else {
@@ -350,9 +323,9 @@
     wrapper.appendChild(btn);
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // MODULE 6 — DYNAMIC PROPERTY DESCRIPTOR HIJACKING & TOP-LEVEL MIRRORING
-  // ─────────────────────────────────────────────────────────────────────────
+  // -------------------------------------------------------------------------
+  // MODULE 6 - DYNAMIC PROPERTY DESCRIPTOR HIJACKING & TOP-LEVEL MIRRORING
+  // -------------------------------------------------------------------------
 
   function hijackProperty(proto, prop) {
     const descriptor = Object.getOwnPropertyDescriptor(proto, prop);
@@ -367,7 +340,7 @@
       set: function (val) {
         originalSet.call(this, val);
         const video = this;
-        setTimeout(() => {
+        setTimeout(function () {
           if (video && isMSEVideo(video)) {
             tryInjectHLSSource(video);
           }
@@ -399,10 +372,11 @@
     console.error('Failed to hijack MediaElement source descriptors:', e);
   }
 
-  // ─── 7. CROSS-FRAME MESSAGE LISTENER & MIRROR VIDEO SYSTEMS ────────────────
-  // Links sandboxed cross-origin iframes with parent page to bypass Apple TV audio-only restrictions
+  // -------------------------------------------------------------------------
+  // 7. CROSS-FRAME MESSAGE LISTENER & MIRROR VIDEO SYSTEMS
+  // -------------------------------------------------------------------------
   
-  window.addEventListener('message', (e) => {
+  window.addEventListener('message', function (e) {
     if (e.data && e.data.type === 'ap-sniffed-url' && e.data.url) {
       const url = e.data.url;
       const host = location.hostname;
@@ -425,7 +399,6 @@
     if (!mirrorVideo) {
       mirrorVideo = _origCreateElement('video');
       mirrorVideo.id = 'ap-mirror-video';
-      // Style it invisible and un-intrusive on parent DOM
       mirrorVideo.style.cssText = 'position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; z-index: -1000;';
       mirrorVideo.setAttribute('x-webkit-airplay', 'allow');
       mirrorVideo.setAttribute('airplay', 'allow');
@@ -460,64 +433,34 @@
     const btn = _origCreateElement('button');
     btn.className = 'ap-btn-injected';
     btn.title     = 'AirPlay video';
-    btn.innerHTML = `
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
-           stroke="currentColor" stroke-width="2.5" stroke-linecap="round"
-           stroke-linejoin="round">
-        <path d="M5 17H3a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h18a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-2"/>
-        <polygon points="12 15 17 21 7 21 12 15"/>
-      </svg>
-    `;
+    btn.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 17H3a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h18a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-2"/><polygon points="12 15 17 21 7 21 12 15"/></svg>';
     
-    // Premium round glassmorphic round overlay button
-    btn.style.cssText = `
-      position: absolute;
-      bottom: 24px;
-      right: 24px;
-      z-index: 2147483647;
-      width: 38px;
-      height: 38px;
-      background: rgba(18, 18, 18, 0.70);
-      color: #ffffff;
-      border: 1px solid rgba(255, 255, 255, 0.2);
-      border-radius: 50%;
-      cursor: pointer;
-      display: none;
-      align-items: center;
-      justify-content: center;
-      backdrop-filter: blur(12px);
-      -webkit-backdrop-filter: blur(12px);
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-      line-height: 0;
-      outline: none;
-      pointer-events: auto !important;
-    `;
+    btn.style.cssText = 'position: absolute; bottom: 24px; right: 24px; z-index: 2147483647; width: 38px; height: 38px; background: rgba(18, 18, 18, 0.70); color: #ffffff; border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 50%; cursor: pointer; display: none; align-items: center; justify-content: center; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3); transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); line-height: 0; outline: none; pointer-events: auto !important;';
 
-    btn.addEventListener('mouseenter', () => {
+    btn.addEventListener('mouseenter', function () {
       btn.style.transform = 'scale(1.08)';
       btn.style.background = 'rgba(30, 30, 30, 0.85)';
       btn.style.borderColor = 'rgba(255, 255, 255, 0.35)';
     });
-    btn.addEventListener('mouseleave', () => {
+    btn.addEventListener('mouseleave', function () {
       btn.style.transform = 'scale(1)';
       btn.style.background = 'rgba(18, 18, 18, 0.70)';
       btn.style.borderColor = 'rgba(255, 255, 255, 0.2)';
     });
-    btn.addEventListener('mousedown', () => {
+    btn.addEventListener('mousedown', function () {
       btn.style.transform = 'scale(0.95)';
     });
-    btn.addEventListener('mouseup', () => {
+    btn.addEventListener('mouseup', function () {
       btn.style.transform = 'scale(1.08)';
     });
 
-    btn.addEventListener('click', (e) => {
+    btn.addEventListener('click', function (e) {
       e.stopPropagation();
       e.preventDefault();
       
-      // Dynamic time syncing: try to match playback location with iframe player state
+      // time syncing
       try {
-        const iframeVideo = iframe.contentDocument?.querySelector('video');
+        const iframeVideo = iframe.contentDocument && iframe.contentDocument.querySelector('video');
         if (iframeVideo) {
           mirrorVideo.currentTime = iframeVideo.currentTime;
         }
@@ -526,13 +469,13 @@
       mirrorVideo.webkitShowPlaybackTargetPicker();
     });
 
-    const show = () => (btn.style.display = 'flex');
-    const hide = () => (btn.style.display = 'none');
+    const show = function () { btn.style.display = 'flex'; };
+    const hide = function () { btn.style.display = 'none'; };
 
     iframe.addEventListener('mouseenter', show);
     iframe.addEventListener('mouseleave', hide);
 
-    mirrorVideo.addEventListener('webkitplaybacktargetavailabilitychanged', (e) => {
+    mirrorVideo.addEventListener('webkitplaybacktargetavailabilitychanged', function (e) {
       if (e.availability === 'available') {
         show();
       } else {
@@ -543,16 +486,16 @@
     wrapper.appendChild(btn);
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // -------------------------------------------------------------------------
   // RECURSIVE DOM & SHADOW DOM WALKERS
-  // ─────────────────────────────────────────────────────────────────────────
+  // -------------------------------------------------------------------------
 
   function findAllVideos(root) {
     const list = [];
     if (!root) return list;
 
     if (typeof root.querySelectorAll === 'function') {
-      root.querySelectorAll('video').forEach(v => {
+      root.querySelectorAll('video').forEach(function (v) {
         if (v.id !== 'ap-mirror-video') list.push(v);
       });
     }
@@ -567,7 +510,7 @@
     let node = walker.currentNode;
     while (node) {
       if (node.shadowRoot) {
-        findAllVideos(node.shadowRoot).forEach(v => {
+        findAllVideos(node.shadowRoot).forEach(function (v) {
           if (v.id !== 'ap-mirror-video') list.push(v);
         });
       }
@@ -576,9 +519,9 @@
     return list;
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // -------------------------------------------------------------------------
   // MAIN PROCESSOR
-  // ─────────────────────────────────────────────────────────────────────────
+  // -------------------------------------------------------------------------
 
   function processVideo(video) {
     if (video.id === 'ap-mirror-video') return; // Skip mirror video
@@ -589,9 +532,9 @@
 
     if (isMSEVideo(video)) {
       if (!tryInjectHLSSource(video)) {
-        setTimeout(() => tryInjectHLSSource(video), 800);
-        setTimeout(() => tryInjectHLSSource(video), 2500);
-        setTimeout(() => tryInjectHLSSource(video), 5000);
+        setTimeout(function () { tryInjectHLSSource(video); }, 800);
+        setTimeout(function () { tryInjectHLSSource(video); }, 2500);
+        setTimeout(function () { tryInjectHLSSource(video); }, 5000);
       }
     } else {
       const currentAttr = video.getAttribute('x-webkit-airplay');
@@ -611,18 +554,20 @@
     injectAirPlayButton(video);
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // -------------------------------------------------------------------------
   // MUTATION OBSERVERS FOR ROOT ELEMENTS
-  // ─────────────────────────────────────────────────────────────────────────
+  // -------------------------------------------------------------------------
 
   function observeRoot(root) {
     if (observedRoots.has(root)) return;
     observedRoots.add(root);
 
-    const observer = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
+    const observer = new MutationObserver(function (mutations) {
+      for (let mIdx = 0; mIdx < mutations.length; mIdx++) {
+        const mutation = mutations[mIdx];
         if (mutation.type === 'childList') {
-          for (const node of mutation.addedNodes) {
+          for (let nIdx = 0; nIdx < mutation.addedNodes.length; nIdx++) {
+            const node = mutation.addedNodes[nIdx];
             if (node.nodeType !== Node.ELEMENT_NODE) continue;
             if (node.tagName === 'VIDEO') {
               processVideo(node);
@@ -658,9 +603,9 @@
     });
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // -------------------------------------------------------------------------
   // INIT
-  // ─────────────────────────────────────────────────────────────────────────
+  // -------------------------------------------------------------------------
 
   function init() {
     observeRoot(document.documentElement);
