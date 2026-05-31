@@ -5,9 +5,13 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @run-at       document-start
+// @version      1.1
+// @updateURL    https://raw.githubusercontent.com/ThisCrashesYouOnPhone/Script/main/sniper.user.js
+// @downloadURL  https://raw.githubusercontent.com/ThisCrashesYouOnPhone/Script/main/sniper.user.js
 // ==/UserScript==
 
 (function() {
+  'use strict';
 
   const SNIPE_HOSTS = [
     'pooembed.eu',
@@ -18,48 +22,131 @@
 
   if (!SNIPE_HOSTS.some(h => location.hostname.includes(h))) return;
 
-  // ─── PHASE 1: IMMEDIATE TIMER KILLING ─────────────────────────────────────
-  // This runs the moment the script loads — BEFORE any page JS.
-  // Overrides setTimeout/setInterval so any future ad timers are blocked.
-  // Long delays (>3s) from page JS are almost always ad/redirect timers.
+  // ─── LOCAL STORAGE FALLBACKS FOR GM STORAGE ────────────────────────────────
+  // Ensures compatibility in sandboxed extensions (Orion) where GM APIs might fail
+  const _getValue = (key, def) => {
+    try {
+      if (typeof GM_getValue === 'function') {
+        const val = GM_getValue(key, def);
+        return val instanceof Promise ? val : Promise.resolve(val);
+      }
+    } catch (e) {}
+    try {
+      const val = localStorage.getItem(key);
+      return Promise.resolve(val !== null ? val : def);
+    } catch (e) {
+      return Promise.resolve(def);
+    }
+  };
+
+  const _setValue = (key, val) => {
+    try {
+      if (typeof GM_setValue === 'function') {
+        const res = GM_setValue(key, val);
+        return res instanceof Promise ? res : Promise.resolve(res);
+      }
+    } catch (e) {}
+    try {
+      localStorage.setItem(key, val);
+      return Promise.resolve();
+    } catch (e) {
+      return Promise.resolve();
+    }
+  };
+
+  // ─── PHASE 1: IMMEDIATE TIMER BLOCKING & SAFE SWEEPER ──────────────────────
+  // Overrides setTimeout/setInterval so future long-delay ad timers are blocked.
+  // Long delays (>3s) from page JS are almost always ad/redirect triggers.
   const _realSetTimeout  = window.setTimeout.bind(window);
   const _realSetInterval = window.setInterval.bind(window);
   const _realClear       = window.clearTimeout.bind(window);
 
-  const SAFE_DELAY_MS = 3000; // Timers under 3s are probably legit (animations, polling)
+  const SAFE_DELAY_MS = 3000; 
   const timerLog = [];
+  const safeTimerIds = new Set();
+
+  // Custom setTimeout wrapper that registers safe timer IDs so they escape the sweeper
+  function safeSetTimeout(fn, delay, ...args) {
+    const id = _realSetTimeout(fn, delay, ...args);
+    safeTimerIds.add(id);
+    return id;
+  }
 
   window.setTimeout = function(fn, delay, ...args) {
-    if (delay > SAFE_DELAY_MS) {
-      timerLog.push({ type: 'timeout-blocked', delay, fn: fn?.name || 'anonymous' });
-      return 0; // Return fake ID, never fires
+    const numDelay = Number(delay) || 0;
+    if (numDelay > SAFE_DELAY_MS) {
+      timerLog.push({ type: 'timeout-blocked', delay: numDelay, fn: fn?.name || 'anonymous' });
+      return 0; // Return fake ID
     }
     return _realSetTimeout(fn, delay, ...args);
   };
 
   window.setInterval = function(fn, delay, ...args) {
-    if (delay > SAFE_DELAY_MS) {
-      timerLog.push({ type: 'interval-blocked', delay, fn: fn?.name || 'anonymous' });
+    const numDelay = Number(delay) || 0;
+    if (numDelay > SAFE_DELAY_MS) {
+      timerLog.push({ type: 'interval-blocked', delay: numDelay, fn: fn?.name || 'anonymous' });
       return 0;
     }
     return _realSetInterval(fn, delay, ...args);
   };
 
-  // After 600ms, kill ALL existing timers that were set before our override
-  // (page JS that ran first may have set timers with the real setTimeout)
-  _realSetTimeout(() => {
+  // Kill ALL timers set by initial page scripts, except our safe timers
+  safeSetTimeout(() => {
     const maxId = _realSetTimeout(() => {}, 0);
-    for (let i = 0; i <= maxId; i++) _realClear(i);
+    for (let i = 0; i <= maxId; i++) {
+      if (!safeTimerIds.has(i)) {
+        _realClear(i);
+      }
+    }
     timerLog.push({ type: 'sweep', killed: maxId });
   }, 600);
-  // ──────────────────────────────────────────────────────────────────────────
 
+  // ─── PHASE 2: POP-UP POPUNDER AND REDIRECT SHIELDS ───────────────────────
+  // Blocks attempts by ad platforms to trigger pop-ups on user interactions.
+  const _realOpen = window.open;
+  window.open = function(url, target, features) {
+    console.log('[SNIPER] Blocked window.open attempt to:', url);
+    // Return dummy window object to keep scripts from throwing
+    return {
+      focus: () => {},
+      close: () => {},
+      closed: true
+    };
+  };
+
+  // Disable alert/confirm spam which redirects sometimes trigger
+  window.alert = function(msg) { console.log('[SNIPER] Blocked alert:', msg); };
+  window.confirm = function(msg) { console.log('[SNIPER] Blocked confirm:', msg); return true; };
+
+  // Inject EasyList CSS to instantly hide visual ad banners and cookies overlays
+  const AD_BLOCK_CSS = `
+    iframe[src*="poop"], iframe[src*="ad"], iframe[src*="doubleclick"], iframe[src*="pop"],
+    .ad-box, .banner-ad, #ad-container, .popunder, .pop-under, .cookie-banner,
+    [class*="popunder"], [id*="popunder"], [class*="-ad-"], [id*="-ad-"], .adsbox {
+      display: none !important;
+      visibility: hidden !important;
+      pointer-events: none !important;
+      opacity: 0 !important;
+      height: 0 !important;
+      width: 0 !important;
+    }
+  `;
+  
+  const injectCSS = () => {
+    const style = document.createElement('style');
+    style.textContent = AD_BLOCK_CSS;
+    (document.head || document.documentElement).appendChild(style);
+  };
+
+  if (document.head) {
+    injectCSS();
+  } else {
+    document.addEventListener('DOMContentLoaded', injectCSS);
+  }
 
   // ─── STATE ────────────────────────────────────────────────────────────────
   let capturedM3u8  = null;
   let takenOver     = false;
-  // ──────────────────────────────────────────────────────────────────────────
-
 
   // ─── NETWORK LOGGER ───────────────────────────────────────────────────────
   const NET_KEY = 'orion_net_log';
@@ -71,12 +158,12 @@
     entry.page = location.href;
     netLog.push(entry);
     if (entry.flag) {
-      GM_getValue(NET_KEY, '[]').then(raw => {
+      _getValue(NET_KEY, '[]').then(raw => {
         try {
           const logs = JSON.parse(raw);
           logs.push(entry);
           if (logs.length > 150) logs.splice(0, logs.length - 150);
-          GM_setValue(NET_KEY, JSON.stringify(logs));
+          _setValue(NET_KEY, JSON.stringify(logs));
         } catch(e) {}
       }).catch(() => {});
     }
@@ -86,19 +173,24 @@
     return /\.m3u8|\.mpd|stream|token|auth|ad|pop|redirect|track|click|secure/i.test(url);
   }
 
-  window.__netSummary = async () => {
-    const s = JSON.parse(await GM_getValue(NET_KEY, '[]'));
-    console.table(s.map(e => ({ ms: e.ms, type: e.type, status: e.status, url: (e.url||'').slice(0,80) })));
+  window.__netSummary = () => {
+    _getValue(NET_KEY, '[]').then(raw => {
+      const s = JSON.parse(raw);
+      console.table(s.map(e => ({ ms: e.ms, type: e.type, status: e.status, url: (e.url||'').slice(0,80) })));
+    });
   };
-  window.__copyNet = async () => {
-    const s = JSON.parse(await GM_getValue(NET_KEY, '[]'));
-    await navigator.clipboard.writeText(JSON.stringify(s, null, 2));
-    console.log('Net log copied:', s.length, 'entries');
+  
+  window.__copyNet = () => {
+    _getValue(NET_KEY, '[]').then(raw => {
+      const s = JSON.parse(raw);
+      navigator.clipboard.writeText(JSON.stringify(s, null, 2)).then(() => {
+        console.log('Net log copied:', s.length, 'entries');
+      });
+    });
   };
-  window.__clearNet = () => GM_setValue(NET_KEY, '[]').then(() => console.log('cleared'));
-  window.__timerLog = () => console.table(timerLog);
-  // ──────────────────────────────────────────────────────────────────────────
 
+  window.__clearNet = () => _setValue(NET_KEY, '[]').then(() => console.log('cleared'));
+  window.__timerLog = () => console.table(timerLog);
 
   // ─── NETWORK SNIFFERS ─────────────────────────────────────────────────────
   const origOpen      = XMLHttpRequest.prototype.open;
@@ -164,26 +256,25 @@
     if (this.src && /\.m3u8/i.test(this.src)) onM3u8(this.src);
     return origLoad.call(this);
   };
-  // ──────────────────────────────────────────────────────────────────────────
-
 
   // ─── M3U8 DETECTED ────────────────────────────────────────────────────────
   function onM3u8(url) {
     if (takenOver) return;
-    const isMaster = !/(index|chunklist|seg|media_\d|chunk)/i.test(url.split('/').pop());
-    if (!capturedM3u8 || isMaster) {
-      capturedM3u8 = url;
-      // Notify parent immediately
-      try {
-        window.parent.postMessage({ type: 'sniper:url', url, host: location.hostname }, '*');
-        window.top.postMessage({ type: 'sniper:url', url, host: location.hostname }, '*');
-      } catch(e) {}
-      // Schedule seamless takeover
-      _realSetTimeout(() => takeover(url), 800);
-    }
+    const lowerUrl = url.toLowerCase();
+    
+    // Check if it's a segment file (we prefer playlists)
+    const isSegment = /(seg|chunk|ts|key|license)/i.test(lowerUrl);
+    if (isSegment && capturedM3u8) return; // Keep our master playlist
+    
+    capturedM3u8 = url;
+    // Notify parent immediately
+    try {
+      window.parent.postMessage({ type: 'sniper:url', url, host: location.hostname }, '*');
+      window.top.postMessage({ type: 'sniper:url', url, host: location.hostname }, '*');
+    } catch(e) {}
+    // Schedule seamless takeover
+    safeSetTimeout(() => takeover(url), 600);
   }
-  // ──────────────────────────────────────────────────────────────────────────
-
 
   // ─── SEAMLESS TAKEOVER ────────────────────────────────────────────────────
   function takeover(m3u8url) {
@@ -201,11 +292,6 @@
       document.querySelector('video')?.parentElement ||
       document.body;
 
-    // Get dimensions to match
-    const rect = container.getBoundingClientRect();
-    const w = rect.width  || window.innerWidth;
-    const h = rect.height || window.innerHeight;
-
     // Build clean player
     const wrapper = document.createElement('div');
     wrapper.style.cssText = `
@@ -218,10 +304,6 @@
       align-items: stretch;
     `;
 
-    // ── The video element ──────────────────────────────────────────────────
-    // Direct m3u8 URL — no blob proxy.
-    // iOS WebKit native HLS handles this without CORS restrictions.
-    // The token is in the URL path itself (/secure/TOKEN/...) — no extra headers needed.
     const video = document.createElement('video');
     video.controls     = true;
     video.autoplay     = true;
@@ -252,14 +334,14 @@
       z-index: 1;
       white-space: nowrap;
       transition: opacity 1s;
+      line-height: 1.4;
     `;
 
     video.addEventListener('playing', () => {
-      _realSetTimeout(() => badge.style.opacity = '0', 3000);
+      safeSetTimeout(() => badge.style.opacity = '0', 3000);
     });
 
     video.addEventListener('error', (e) => {
-      // Direct URL failed — show copy button prominently
       badge.style.cssText = badge.style.cssText.replace('rgba(0,255,136,0.15)', 'rgba(255,80,80,0.2)');
       badge.style.color = '#ff8888';
       badge.textContent = '⚠ Tap 📋 to copy URL → open in VLC or Infuse';
@@ -273,8 +355,8 @@
     copyBtn.title = 'Copy raw stream URL';
     copyBtn.style.cssText = `
       position: absolute;
-      bottom: 10px;
-      right: 10px;
+      bottom: 16px;
+      right: 16px;
       background: rgba(0,0,0,0.5);
       color: #fff;
       border: 1px solid rgba(255,255,255,0.2);
@@ -288,11 +370,12 @@
       align-items: center;
       justify-content: center;
     `;
+    
     copyBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       navigator.clipboard.writeText(m3u8url).then(() => {
         copyBtn.textContent = '✅';
-        _realSetTimeout(() => copyBtn.textContent = '📋', 2000);
+        safeSetTimeout(() => copyBtn.textContent = '📋', 2000);
       });
     });
 
@@ -307,7 +390,6 @@
       container.innerHTML = '';
       container.appendChild(wrapper);
     } else {
-      // Fallback: full page
       document.body.style.cssText = 'margin:0;padding:0;background:#000;overflow:hidden';
       wrapper.style.position = 'fixed';
       document.body.innerHTML = '';
@@ -317,8 +399,6 @@
     console.log('[SNIPER] ✓ Takeover complete:', m3u8url);
     saveNet({ type: 'takeover', url: m3u8url, flag: true });
   }
-  // ──────────────────────────────────────────────────────────────────────────
-
 
   // ─── PARENT COMMUNICATION ─────────────────────────────────────────────────
   window.addEventListener('message', e => {
@@ -326,6 +406,5 @@
       try { e.source.postMessage({ type: 'sniper:url', url: capturedM3u8, host: location.hostname }, '*'); } catch(e) {}
     }
   });
-  // ──────────────────────────────────────────────────────────────────────────
 
 })();
