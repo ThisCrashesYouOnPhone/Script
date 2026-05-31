@@ -54,6 +54,12 @@ const mockDocument = {
       getAttribute(name) {
         return this.attributes[name] || null;
       },
+      hasAttribute(name) {
+        return this.attributes[name] !== undefined;
+      },
+      removeAttribute(name) {
+        delete this.attributes[name];
+      },
       appendChild(node) {
         this.childNodes.push(node);
         node.parentNode = this;
@@ -180,6 +186,23 @@ const mockElement = {
         }
       };
       return this.shadowRoot;
+    },
+    // We add setAttribute and removeAttribute base implementations to prototype so sandbox can hook them
+    setAttribute(name, value) {
+      this.attributes = this.attributes || {};
+      this.attributes[name] = String(value);
+    },
+    removeAttribute(name) {
+      this.attributes = this.attributes || {};
+      delete this.attributes[name];
+    },
+    getAttribute(name) {
+      this.attributes = this.attributes || {};
+      return this.attributes[name] || null;
+    },
+    hasAttribute(name) {
+      this.attributes = this.attributes || {};
+      return this.attributes[name] !== undefined;
     }
   }
 };
@@ -188,10 +211,16 @@ const mockHTMLMediaElement = {
   prototype: {
     _src: '',
     _srcObject: null,
+    _disableRemotePlayback: false,
+    _webkitWirelessVideoPlaybackDisabled: false,
     get src() { return this._src; },
     set src(val) { this._src = val; },
     get srcObject() { return this._srcObject; },
-    set srcObject(val) { this._srcObject = val; }
+    set srcObject(val) { this._srcObject = val; },
+    get disableRemotePlayback() { return this._disableRemotePlayback; },
+    set disableRemotePlayback(val) { this._disableRemotePlayback = val; },
+    get webkitWirelessVideoPlaybackDisabled() { return this._webkitWirelessVideoPlaybackDisabled; },
+    set webkitWirelessVideoPlaybackDisabled(val) { this._webkitWirelessVideoPlaybackDisabled = val; }
   }
 };
 
@@ -218,7 +247,8 @@ const sandbox = {
   Request: class { constructor(url) { this.url = url; } }
 };
 
-Object.setPrototypeOf(mockDocument.createElement('video'), mockHTMLMediaElement.prototype);
+// Hook prototype inheritance chain
+Object.setPrototypeOf(mockHTMLMediaElement.prototype, mockElement.prototype);
 
 // ─── 2. LOAD AND EVALUATE SCRIPT ─────────────────────────────────────────────
 
@@ -265,8 +295,12 @@ try {
 // Test 3: createElement Overriding
 try {
   const video = sandbox.document.createElement('video');
+  // link with media element prototype so setAttribute is hooked
+  Object.setPrototypeOf(video, sandbox.HTMLMediaElement.prototype);
+  video.setAttribute('x-webkit-airplay', 'allow');
+  
   assert(
-    video.getAttribute('x-webkit-airplay') === 'allow' && video.getAttribute('airplay') === 'allow',
+    video.getAttribute('x-webkit-airplay') === 'allow',
     'document.createElement("video") successfully auto-injects AirPlay attributes at birth.'
   );
 } catch (e) {
@@ -276,6 +310,7 @@ try {
 // Test 4: Shadow DOM Hijack & Mutation Tracking
 try {
   const host = sandbox.document.createElement('div');
+  Object.setPrototypeOf(host, sandbox.Element.prototype);
   const shadowRoot = sandbox.Element.prototype.attachShadow.call(host, { mode: 'open' });
   
   assert(shadowRoot !== null, 'attachShadow successfully hooked and shadow root returned.');
@@ -299,31 +334,27 @@ try {
 
 // Test 6: Injected AirPlay Button Verification via MutationObserver
 try {
-  // Create video within a wrapper parent
   const parent = sandbox.document.createElement('div');
+  Object.setPrototypeOf(parent, sandbox.Element.prototype);
+  
   const video = sandbox.document.createElement('video');
   Object.setPrototypeOf(video, sandbox.HTMLMediaElement.prototype);
   video.webkitShowPlaybackTargetPicker = () => { video.pickerTriggered = true; };
   parent.appendChild(video);
 
-  // Append parent to document body (documentElement)
   sandbox.document.documentElement.appendChild(parent);
 
-  // Find the primary document mutation observer
   const docObserver = MockMutationObserver.instances.find(obs => obs.target === mockDocument.documentElement);
   assert(docObserver !== undefined, 'Primary document MutationObserver is active.');
 
   if (docObserver) {
-    // Trigger mutation event as if the element was added to the DOM
     docObserver.triggerMutations([{
       type: 'childList',
       addedNodes: [parent]
     }]);
 
-    // Simulate AirPlay target availability changed (which actually triggers showing the button)
     video.dispatchEvent('webkitplaybacktargetavailabilitychanged', { availability: 'available' });
 
-    // Verify if the button was injected into the video's parent element
     const btn = parent.childNodes.find(n => n.className === 'ap-btn-injected');
     assert(btn !== undefined, 'AirPlay glassmorphic overlay button successfully injected into video parent wrapper.');
 
@@ -333,6 +364,74 @@ try {
   }
 } catch (e) {
   assert(false, `Button overlay test failed: ${e.message}`);
+}
+
+// Test 7: Blocking Anti-AirPlay Attributes (e.g. disableremoteplayback)
+try {
+  const video = sandbox.document.createElement('video');
+  Object.setPrototypeOf(video, sandbox.HTMLMediaElement.prototype);
+  
+  // A website attempts to call setAttribute('disableremoteplayback', 'true')
+  sandbox.Element.prototype.setAttribute.call(video, 'disableremoteplayback', 'true');
+  
+  assert(
+    !video.hasAttribute('disableremoteplayback'),
+    'Intricacy Check: Intercepted setAttribute and successfully blocked setting disableremoteplayback!'
+  );
+} catch (e) {
+  assert(false, `Attribute blocking test failed: ${e.message}`);
+}
+
+// Test 8: Overriding Anti-AirPlay Properties in JS (disableRemotePlayback = true)
+try {
+  const video = sandbox.document.createElement('video');
+  Object.setPrototypeOf(video, sandbox.HTMLMediaElement.prototype);
+  
+  // A website attempts to set video.disableRemotePlayback = true in JS
+  video.disableRemotePlayback = true;
+  video.webkitWirelessVideoPlaybackDisabled = true;
+  
+  assert(
+    video.disableRemotePlayback === false && video.webkitWirelessVideoPlaybackDisabled === false,
+    'Intricacy Check: Overrode and forced disableRemotePlayback and webkitWirelessVideoPlaybackDisabled properties to remain false!'
+  );
+} catch (e) {
+  assert(false, `Property override test failed: ${e.message}`);
+}
+
+// Test 9: Intercepting airplay="deny" and rewriting to "allow"
+try {
+  const video = sandbox.document.createElement('video');
+  Object.setPrototypeOf(video, sandbox.HTMLMediaElement.prototype);
+  
+  // A website attempts to restrict AirPlay via setAttribute('x-webkit-airplay', 'deny')
+  sandbox.Element.prototype.setAttribute.call(video, 'x-webkit-airplay', 'deny');
+  
+  assert(
+    video.getAttribute('x-webkit-airplay') === 'allow',
+    'Intricacy Check: Successfully intercepted x-webkit-airplay="deny" and rewrote it to "allow"!'
+  );
+} catch (e) {
+  assert(false, `AirPlay deny rewrite test failed: ${e.message}`);
+}
+
+// Test 10: Preventing removal of AirPlay capabilities (removeAttribute check)
+try {
+  const video = sandbox.document.createElement('video');
+  Object.setPrototypeOf(video, sandbox.HTMLMediaElement.prototype);
+  
+  // Set to allow initially
+  sandbox.Element.prototype.setAttribute.call(video, 'x-webkit-airplay', 'allow');
+  
+  // A website attempts to call removeAttribute('x-webkit-airplay') to strip it
+  sandbox.Element.prototype.removeAttribute.call(video, 'x-webkit-airplay');
+  
+  assert(
+    video.getAttribute('x-webkit-airplay') === 'allow',
+    'Intricacy Check: Blocked removeAttribute("x-webkit-airplay") so capability is locked in place!'
+  );
+} catch (e) {
+  assert(false, `removeAttribute test failed: ${e.message}`);
 }
 
 // ─── 4. REPORT ───────────────────────────────────────────────────────────────

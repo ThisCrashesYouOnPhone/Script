@@ -8,7 +8,7 @@
 // @match        *://*/*
 // @run-at       document-start
 // @grant        none
-// @version      1.2
+// @version      1.3
 // @updateURL    https://raw.githubusercontent.com/ThisCrashesYouOnPhone/Script/main/script.user.js
 // @downloadURL  https://raw.githubusercontent.com/ThisCrashesYouOnPhone/Script/main/script.user.js
 // ==/UserScript==
@@ -34,6 +34,8 @@
   const _origFetch         = window.fetch ? window.fetch.bind(window) : null;
   const _origXHROpen       = XMLHttpRequest.prototype.open;
   const _origAttachShadow  = Element.prototype.attachShadow;
+  const _origSetAttribute  = Element.prototype.setAttribute;
+  const _origRemoveAttribute = Element.prototype.removeAttribute;
 
   // ─────────────────────────────────────────────────────────────────────────
   // MODULE 1 — NETWORK INTERCEPTOR
@@ -79,7 +81,7 @@
 
   // ─────────────────────────────────────────────────────────────────────────
   // MODULE 2 — DOM CREATION & SHADOW DOM INTERCEPTORS
-  // Hooks createElement and attachShadow to intercept videos at birth.
+  // Hooks createElement, attachShadow, setAttribute, and removeAttribute.
   // ─────────────────────────────────────────────────────────────────────────
 
   document.createElement = function (tag, ...args) {
@@ -104,6 +106,53 @@
       }
       return shadow;
     };
+  }
+
+  // Hook setAttribute on elements to block websites disabling AirPlay/RemotePlayback
+  Element.prototype.setAttribute = function (name, value) {
+    const tagName = this.tagName ? this.tagName.toLowerCase() : '';
+    if (tagName === 'video') {
+      const lowerName = name.toLowerCase();
+      if (lowerName === 'disableremoteplayback' || lowerName === 'x-webkit-wireless-video-playback-disabled') {
+        // Ignore attempts to disable remote playback or AirPlay video
+        return;
+      }
+      if (lowerName === 'x-webkit-airplay' || lowerName === 'airplay') {
+        // Websites might set airplay="deny". We force it to "allow"
+        return _origSetAttribute.call(this, name, 'allow');
+      }
+    }
+    return _origSetAttribute.call(this, name, value);
+  };
+
+  // Hook removeAttribute to block websites from deleting AirPlay-enabling attributes
+  Element.prototype.removeAttribute = function (name) {
+    const tagName = this.tagName ? this.tagName.toLowerCase() : '';
+    if (tagName === 'video') {
+      const lowerName = name.toLowerCase();
+      if (lowerName === 'x-webkit-airplay' || lowerName === 'airplay') {
+        // Prevent removal of AirPlay capabilities
+        return;
+      }
+    }
+    return _origRemoveAttribute.call(this, name);
+  };
+
+  // Helper to sweep and clean any pre-existing anti-AirPlay attributes on a video
+  function cleanBlockedAttributes(video) {
+    if (video.hasAttribute('disableremoteplayback')) {
+      video.removeAttribute('disableremoteplayback');
+    }
+    if (video.hasAttribute('x-webkit-wireless-video-playback-disabled')) {
+      video.removeAttribute('x-webkit-wireless-video-playback-disabled');
+    }
+    // Ensure AirPlay enabling attributes exist and are set to allow
+    if (video.getAttribute('x-webkit-airplay') !== 'allow') {
+      video.setAttribute('x-webkit-airplay', 'allow');
+    }
+    if (video.getAttribute('airplay') !== 'allow') {
+      video.setAttribute('airplay', 'allow');
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -165,8 +214,11 @@
     const playbackRate = video.playbackRate;
 
     const clone = video.cloneNode(true);
+    // Guarantee attributes are correct on clone
     clone.setAttribute('x-webkit-airplay', 'allow');
     clone.setAttribute('airplay', 'allow');
+    if (clone.hasAttribute('disableremoteplayback')) clone.removeAttribute('disableremoteplayback');
+    if (clone.hasAttribute('x-webkit-wireless-video-playback-disabled')) clone.removeAttribute('x-webkit-wireless-video-playback-disabled');
 
     video.parentNode.replaceChild(clone, video);
 
@@ -280,7 +332,8 @@
 
   // ─────────────────────────────────────────────────────────────────────────
   // MODULE 6 — DYNAMIC PROPERTY DESCRIPTOR HIJACKING
-  // Detects src or srcObject reassignment (important for playlist sites).
+  // Detects src or srcObject reassignment (important for playlist sites) AND
+  // forces disableRemotePlayback/webkitWirelessVideoPlaybackDisabled to false.
   // ─────────────────────────────────────────────────────────────────────────
 
   function hijackProperty(proto, prop) {
@@ -295,7 +348,6 @@
       get: descriptor.get,
       set: function (val) {
         originalSet.call(this, val);
-        // source updated, trigger process block
         const video = this;
         setTimeout(() => {
           if (video && isMSEVideo(video)) {
@@ -306,10 +358,27 @@
     });
   }
 
+  function forcePropertyFalse(proto, prop) {
+    Object.defineProperty(proto, prop, {
+      configurable: true,
+      enumerable: true,
+      get: function () {
+        return false;
+      },
+      set: function (val) {
+        // Ignore attempts by the site to set this to true
+      }
+    });
+  }
+
   // Hijack src and srcObject property descriptors on HTMLMediaElement prototype
   try {
     hijackProperty(HTMLMediaElement.prototype, 'src');
     hijackProperty(HTMLMediaElement.prototype, 'srcObject');
+    
+    // Lock down properties used by players to restrict/disable AirPlay video
+    forcePropertyFalse(HTMLMediaElement.prototype, 'disableRemotePlayback');
+    forcePropertyFalse(HTMLMediaElement.prototype, 'webkitWirelessVideoPlaybackDisabled');
   } catch (e) {
     console.error('Failed to hijack MediaElement source descriptors:', e);
   }
@@ -352,6 +421,9 @@
   function processVideo(video) {
     if (processedVideos.has(video)) return;
     processedVideos.add(video);
+
+    // Strip static blockages and enforce correct airplay attributes
+    cleanBlockedAttributes(video);
 
     if (isMSEVideo(video)) {
       // MSE Path
@@ -399,12 +471,21 @@
               findAllVideos(node).forEach(processVideo);
             }
           }
-        } else if (mutation.type === 'attributes' && mutation.attributeName === 'src') {
-          // Detect changes to the src attribute on existing videos
+        } else if (mutation.type === 'attributes') {
           const target = mutation.target;
           if (target && target.tagName === 'VIDEO') {
-            if (isMSEVideo(target)) {
-              tryInjectHLSSource(target);
+            if (mutation.attributeName === 'src') {
+              if (isMSEVideo(target)) {
+                tryInjectHLSSource(target);
+              }
+            } else if (
+              mutation.attributeName === 'disableremoteplayback' ||
+              mutation.attributeName === 'x-webkit-wireless-video-playback-disabled' ||
+              mutation.attributeName === 'x-webkit-airplay' ||
+              mutation.attributeName === 'airplay'
+            ) {
+              // Website dynamically changed anti-AirPlay attributes, clean them!
+              cleanBlockedAttributes(target);
             }
           }
         }
@@ -415,7 +496,7 @@
       childList: true,
       subtree:   true,
       attributes: true,
-      attributeFilter: ['src']
+      attributeFilter: ['src', 'disableremoteplayback', 'x-webkit-wireless-video-playback-disabled', 'x-webkit-airplay', 'airplay']
     });
   }
 
