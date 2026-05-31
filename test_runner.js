@@ -32,6 +32,15 @@ const mockDocument = {
       node.parentNode = this;
     }
   },
+  body: {
+    tagName: 'BODY',
+    nodeType: 1,
+    childNodes: [],
+    appendChild(node) {
+      this.childNodes.push(node);
+      node.parentNode = this;
+    }
+  },
   createElement(tag) {
     const el = {
       tagName: tag.toUpperCase(),
@@ -105,6 +114,39 @@ const mockDocument = {
     };
     return el;
   },
+  getElementById(id) {
+    if (id === 'ap-mirror-video') {
+      return this.body.childNodes.find(n => n.id === 'ap-mirror-video') || null;
+    }
+    return null;
+  },
+  querySelector(sel) {
+    // Recursive search to match browser query engines
+    function findRecursive(node) {
+      if (!node) return null;
+      const tagName = node.tagName ? node.tagName.toLowerCase() : '';
+      
+      // Match query
+      if (sel.includes('iframe') && tagName === 'iframe') {
+        return node;
+      }
+      if (sel === 'video' && tagName === 'video') {
+        return node;
+      }
+      if (sel === 'source[data-ap-injected]') {
+        return node.childNodes?.find(n => n.tagName === 'SOURCE' && n.attributes['data-ap-injected'] === 'true') || null;
+      }
+      
+      if (node.childNodes) {
+        for (const child of node.childNodes) {
+          const found = findRecursive(child);
+          if (found) return found;
+        }
+      }
+      return null;
+    }
+    return findRecursive(this.body) || findRecursive(this.documentElement);
+  },
   createTreeWalker(root, whatToShow, filter, entityReferenceExpansion) {
     let list = [];
     function walk(node) {
@@ -171,14 +213,26 @@ const mockWindow = {
   XMLHttpRequest: MockXMLHttpRequest,
   getComputedStyle(el) {
     return { position: 'static' };
+  },
+  listeners: {},
+  addEventListener(event, cb) {
+    this.listeners[event] = cb;
+  },
+  dispatchEvent(event, data) {
+    if (this.listeners[event]) {
+      this.listeners[event](data);
+    }
   }
 };
+
+// Circular reference for window.top checks
+mockWindow.top = mockWindow;
 
 const mockElement = {
   prototype: {
     attachShadow(init) {
       this.shadowRoot = {
-        nodeType: 11, // Document fragment
+        nodeType: 11,
         childNodes: [],
         appendChild(node) {
           this.childNodes.push(node);
@@ -187,7 +241,6 @@ const mockElement = {
       };
       return this.shadowRoot;
     },
-    // We add setAttribute and removeAttribute base implementations to prototype so sandbox can hook them
     setAttribute(name, value) {
       this.attributes = this.attributes || {};
       this.attributes[name] = String(value);
@@ -247,11 +300,10 @@ const sandbox = {
   Request: class { constructor(url) { this.url = url; } }
 };
 
-// Hook prototype inheritance chain
+// Hook prototypes
 Object.setPrototypeOf(mockHTMLMediaElement.prototype, mockElement.prototype);
 
-// ─── 2. LOAD AND EVALUATE SCRIPT ─────────────────────────────────────────────
-
+// Setup VM sandbox context
 const scriptPath = path.join(__dirname, 'airplay.user.js');
 const scriptContent = fs.readFileSync(scriptPath, 'utf8');
 
@@ -295,7 +347,6 @@ try {
 // Test 3: createElement Overriding
 try {
   const video = sandbox.document.createElement('video');
-  // link with media element prototype so setAttribute is hooked
   Object.setPrototypeOf(video, sandbox.HTMLMediaElement.prototype);
   video.setAttribute('x-webkit-airplay', 'allow');
   
@@ -366,12 +417,10 @@ try {
   assert(false, `Button overlay test failed: ${e.message}`);
 }
 
-// Test 7: Blocking Anti-AirPlay Attributes (e.g. disableremoteplayback)
+// Test 7: Blocking Anti-AirPlay Attributes
 try {
   const video = sandbox.document.createElement('video');
   Object.setPrototypeOf(video, sandbox.HTMLMediaElement.prototype);
-  
-  // A website attempts to call setAttribute('disableremoteplayback', 'true')
   sandbox.Element.prototype.setAttribute.call(video, 'disableremoteplayback', 'true');
   
   assert(
@@ -382,12 +431,11 @@ try {
   assert(false, `Attribute blocking test failed: ${e.message}`);
 }
 
-// Test 8: Overriding Anti-AirPlay Properties in JS (disableRemotePlayback = true)
+// Test 8: Overriding Anti-AirPlay Properties in JS
 try {
   const video = sandbox.document.createElement('video');
   Object.setPrototypeOf(video, sandbox.HTMLMediaElement.prototype);
   
-  // A website attempts to set video.disableRemotePlayback = true in JS
   video.disableRemotePlayback = true;
   video.webkitWirelessVideoPlaybackDisabled = true;
   
@@ -399,12 +447,10 @@ try {
   assert(false, `Property override test failed: ${e.message}`);
 }
 
-// Test 9: Intercepting airplay="deny" and rewriting to "allow"
+// Test 9: Intercepting airplay="deny"
 try {
   const video = sandbox.document.createElement('video');
   Object.setPrototypeOf(video, sandbox.HTMLMediaElement.prototype);
-  
-  // A website attempts to restrict AirPlay via setAttribute('x-webkit-airplay', 'deny')
   sandbox.Element.prototype.setAttribute.call(video, 'x-webkit-airplay', 'deny');
   
   assert(
@@ -415,15 +461,11 @@ try {
   assert(false, `AirPlay deny rewrite test failed: ${e.message}`);
 }
 
-// Test 10: Preventing removal of AirPlay capabilities (removeAttribute check)
+// Test 10: Preventing removal of AirPlay capabilities
 try {
   const video = sandbox.document.createElement('video');
   Object.setPrototypeOf(video, sandbox.HTMLMediaElement.prototype);
-  
-  // Set to allow initially
   sandbox.Element.prototype.setAttribute.call(video, 'x-webkit-airplay', 'allow');
-  
-  // A website attempts to call removeAttribute('x-webkit-airplay') to strip it
   sandbox.Element.prototype.removeAttribute.call(video, 'x-webkit-airplay');
   
   assert(
@@ -432,6 +474,72 @@ try {
   );
 } catch (e) {
   assert(false, `removeAttribute test failed: ${e.message}`);
+}
+
+// Test 11: Cross-Frame Sniffing Coordination (Bypass restricted iframe blocks)
+try {
+  mockWindow.dispatchEvent('message', {
+    data: {
+      type: 'ap-sniffed-url',
+      url: 'https://iframe-video-provider.net/hls/master.m3u8'
+    }
+  });
+
+  const mirror = mockDocument.getElementById('ap-mirror-video');
+  assert(
+    mirror !== null && mirror.src === 'https://iframe-video-provider.net/hls/master.m3u8',
+    'Cineby Bypass Check: Successfully listened to cross-frame postMessages and created parent-level mirror video element `#ap-mirror-video`!'
+  );
+} catch (e) {
+  assert(false, `Cross-frame test failed: ${e.message}`);
+}
+
+// Test 12: Parent-Level Mirror Video Node Creation
+try {
+  const mirror = mockDocument.getElementById('ap-mirror-video');
+  
+  assert(
+    mirror !== null && mirror.src === 'https://iframe-video-provider.net/hls/master.m3u8',
+    'Cineby Bypass Check: Validated parent-level mirror video element loaded the sniffed stream!'
+  );
+} catch (e) {
+  assert(false, `Mirror video node check failed: ${e.message}`);
+}
+
+// Test 13: Top-Level Iframe Overlay & Click Target Picker
+try {
+  const parent = sandbox.document.createElement('div');
+  Object.setPrototypeOf(parent, sandbox.Element.prototype);
+  
+  const iframe = sandbox.document.createElement('iframe');
+  Object.setPrototypeOf(iframe, sandbox.Element.prototype);
+  iframe.setAttribute('src', 'https://vidsrc.xyz/embed/movie');
+  parent.appendChild(iframe);
+  
+  mockDocument.body.appendChild(parent);
+
+  // Trigger top level mirror overlay setup again with our newly added iframe present
+  sandbox.window.dispatchEvent('message', {
+    data: {
+      type: 'ap-sniffed-url',
+      url: 'https://iframe-video-provider.net/hls/master2.m3u8'
+    }
+  });
+
+  // Verify that parent-level glassmorphic button overlay is appended to overlay the iframe
+  const btn = parent.childNodes.find(n => n.className === 'ap-btn-injected');
+  assert(btn !== undefined, 'Cineby Bypass Check: Injected premium AirPlay overlay button directly onto the top-level parent wrapper of the player iframe!');
+  
+  if (btn) {
+    const mirrorVideo = mockDocument.getElementById('ap-mirror-video');
+    btn.dispatchEvent('click', { stopPropagation: () => {}, preventDefault: () => {} });
+    assert(
+      mirrorVideo.pickerOpened === true,
+      'Cineby Bypass Check: Tapping parent-level AirPlay button overlay successfully engages target picker on top-level mirror video!'
+    );
+  }
+} catch (e) {
+  assert(false, `Overlay click test failed: ${e.message}`);
 }
 
 // ─── 4. REPORT ───────────────────────────────────────────────────────────────

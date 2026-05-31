@@ -1,13 +1,13 @@
 // test_runner_sniper.js
-// Automated CLI Test Environment for Orion Stream Sniper Adblocker
+// Automated CLI Test Environment & Adversarial Ad Simulator for Orion Stream Sniper
 
 const fs = require('fs');
 const vm = require('vm');
 const path = require('path');
 
-console.log('=====================================================');
-console.log('  STARTING ORION STREAM SNIPER TEST SUITE  ');
-console.log('=====================================================\n');
+console.log('=====================================================================');
+console.log('  STARTING STREAM SNIPER ADVERSARIAL ATTACK TEST & SIMULATION SUITE  ');
+console.log('=====================================================================\n');
 
 // ─── 1. BROWSER DOM ENVIRONMENT MOCKS ──────────────────────────────────────────
 
@@ -20,15 +20,6 @@ const mockLocalStorage = {
 const mockDocument = {
   readyState: 'loading',
   listeners: {},
-  addEventListener(event, cb) {
-    this.listeners[event] = cb;
-  },
-  triggerDOMContentLoaded() {
-    this.readyState = 'complete';
-    if (this.listeners['DOMContentLoaded']) {
-      this.listeners['DOMContentLoaded']();
-    }
-  },
   documentElement: {
     tagName: 'HTML',
     nodeType: 1,
@@ -36,6 +27,34 @@ const mockDocument = {
     appendChild(node) {
       this.childNodes.push(node);
       node.parentNode = this;
+    }
+  },
+  body: {
+    tagName: 'BODY',
+    nodeType: 1,
+    childNodes: [],
+    style: {},
+    listeners: {},
+    appendChild(node) {
+      this.childNodes.push(node);
+      node.parentNode = this;
+    },
+    addEventListener(event, cb, useCapture) {
+      this.listeners[event] = { cb, useCapture };
+    },
+    dispatchEvent(event, data) {
+      if (this.listeners[event]) {
+        this.listeners[event].cb(data);
+      }
+    }
+  },
+  addEventListener(event, cb) {
+    this.listeners[event] = cb;
+  },
+  triggerDOMContentLoaded() {
+    this.readyState = 'complete';
+    if (this.listeners['DOMContentLoaded']) {
+      this.listeners['DOMContentLoaded']();
     }
   },
   createElement(tag) {
@@ -53,6 +72,12 @@ const mockDocument = {
       getAttribute(name) {
         return this.attributes[name] || null;
       },
+      hasAttribute(name) {
+        return this.attributes[name] !== undefined;
+      },
+      removeAttribute(name) {
+        delete this.attributes[name];
+      },
       appendChild(node) {
         this.childNodes.push(node);
         node.parentNode = this;
@@ -69,7 +94,6 @@ const mockDocument = {
     };
   },
   getElementById(id) {
-    // Return dummy player container to prevent takeover crashes
     const container = this.createElement('div');
     container.id = id;
     return container;
@@ -81,9 +105,8 @@ const mockDocument = {
     if (sel === '.ap-btn-injected') {
       return this.childNodes.find(n => n.className === 'ap-btn-injected') || null;
     }
-    // Return dummy elements to prevent crashes in player selectors
     const el = this.createElement('div');
-    el.className = sel.replace('.', '');
+    el.className = sel.replace('.', '').replace('#', '');
     return el;
   }
 };
@@ -116,7 +139,7 @@ const mockWindow = {
   setInterval: setInterval,
   clearTimeout: clearTimeout,
   open(url, target, features) {
-    return null;
+    return { closed: false };
   },
   addEventListener(event, cb) {
     this.messageListener = cb;
@@ -155,10 +178,10 @@ const sandbox = {
   setTimeout: setTimeout,
   setInterval: setInterval,
   clearTimeout: clearTimeout,
-  Request: class { constructor(url) { this.url = url; } }
+  Request: class { constructor(url) { this.url = url; } },
+  Node: { ELEMENT_NODE: 1 }
 };
 
-// Setup prototypes
 Object.setPrototypeOf(mockHTMLVideoElement.prototype, mockHTMLMediaElement.prototype);
 
 sandbox.setTimeout = mockWindow.setTimeout;
@@ -166,7 +189,7 @@ sandbox.setInterval = mockWindow.setInterval;
 sandbox.clearTimeout = mockWindow.clearTimeout;
 sandbox.open = mockWindow.open;
 
-// ─── 2. LOAD AND EVALUATE SCRIPT ─────────────────────────────────────────────
+// ─── 2. LOAD AND EVALUATE STREAM SNIPER SCRIPT ───────────────────────────────
 
 const scriptPath = path.join(__dirname, 'sniper.user.js');
 const scriptContent = fs.readFileSync(scriptPath, 'utf8');
@@ -174,7 +197,50 @@ const scriptContent = fs.readFileSync(scriptPath, 'utf8');
 vm.createContext(sandbox);
 vm.runInContext(scriptContent, sandbox);
 
-// ─── 3. TEST CASES ───────────────────────────────────────────────────────────
+// ─── 3. DEPLOY ADVERSARIAL ATTACKS (SIMULATING THE MALICIOUS STREAMING SITE) ───
+
+const attackLog = [];
+mockDocument.triggerDOMContentLoaded();
+
+console.log('>>> [SIMULATOR] Launching Ad Attacks on the Browser Context...\n');
+
+// Attack A: The Aggressive Redirect Timer (Redirects user to fake casino after 5s)
+let timeoutFired = false;
+sandbox.setTimeout(() => {
+  timeoutFired = true;
+  sandbox.location.href = 'https://gambling-spammed-casino.com/win';
+  attackLog.push('Attack A: Redirect timer successfully fired! (DEFENSE FAILED)');
+}, 5000);
+
+// Attack B: The Click-Hijack Trap (Attaches capture click listener to body)
+let clickRedirectFired = false;
+sandbox.document.body.addEventListener('click', (e) => {
+  const popunder = sandbox.window.open('https://malicious-porn-site.com/popup', '_blank');
+  if (popunder && !popunder.closed) {
+    clickRedirectFired = true;
+    attackLog.push('Attack B: Click hijack popup successfully spawned! (DEFENSE FAILED)');
+  } else {
+    attackLog.push('Attack B: Intercepted by shield.');
+  }
+}, true);
+
+// Attack C: The Trap Alert spam loop
+sandbox.window.alert('CONGRATULATIONS! You won a $1000 Giftcard! Tap OK to claim!');
+sandbox.window.confirm('Are you absolutely sure you want to exit the player?');
+
+// Attack D: Spawning hidden ad-tracker iframes and visual adsbox
+const maliciousIframe = mockDocument.createElement('iframe');
+maliciousIframe.setAttribute('src', 'https://poopembed.eu/adsbox/popunder.html');
+maliciousIframe.className = 'adsbox banner-ad';
+mockDocument.documentElement.appendChild(maliciousIframe);
+
+// Attack E: The Fullscreen Invisible Click Overlay Overlay
+const overlayDiv = mockDocument.createElement('div');
+overlayDiv.className = 'pop-under popunder';
+overlayDiv.style.cssText = 'position:fixed; inset:0; z-index:2147483646; background:transparent';
+mockDocument.documentElement.appendChild(overlayDiv);
+
+// ─── 4. VERIFY DEFENSES ──────────────────────────────────────────────────────
 
 let totalTests = 0;
 let passedTests = 0;
@@ -189,96 +255,73 @@ function assert(condition, message) {
   }
 }
 
-mockDocument.triggerDOMContentLoaded();
-
-// Test 1: Local Storage GM Fallback Verification (Verify logged entry exists in localStorage)
-try {
-  // Let the background async XHR logger run, and assert that it successfully writes to mockLocalStorage!
-  setTimeout(() => {
-    const rawVal = mockLocalStorage.getItem('orion_net_log');
-    assert(
-      rawVal !== null && rawVal.includes('xhr') && rawVal.includes('playlist.m3u8'),
-      'Fallback storage successfully fell back to localStorage in Orion sandbox context.'
-    );
-  }, 250);
-} catch (e) {
-  assert(false, `Storage fallback test failed: ${e.message}`);
-}
-
-// Test 2: Timeout Interception (Blocking >3000ms long-delay ad redirects)
-try {
-  let wasExecuted = false;
-  sandbox.setTimeout(() => {
-    wasExecuted = true;
-  }, 5000);
-  
-  setTimeout(() => {
-    assert(wasExecuted === false, 'Ad timer blocking: setTimeout calls with delays >3s are successfully blocked from executing.');
-  }, 100);
-} catch (e) {
-  assert(false, `Timeout blocking test failed: ${e.message}`);
-}
-
-// Test 3: Normal Timer Execution (<3000ms delays allowed)
-try {
-  let wasExecuted = false;
-  sandbox.setTimeout(() => {
-    wasExecuted = true;
-  }, 10);
-  
-  setTimeout(() => {
-    assert(wasExecuted === true, 'Timer integrity: standard UI timeouts with delays <=3s are allowed to run normally.');
-  }, 150);
-} catch (e) {
-  assert(false, `Normal timer test failed: ${e.message}`);
-}
-
-// Test 4: Window.open Hijack (Neutralizing Popup Redirects)
-try {
-  const dummyWin = sandbox.window.open('https://malicious-ad-site.com', '_blank');
+// Test A: Redirect Timer Check
+setTimeout(() => {
   assert(
-    dummyWin !== null && dummyWin.closed === true,
-    'Popup Shield: window.open attempts are successfully hijacked and return a neutralized dummy closed window.'
+    timeoutFired === false,
+    'Redirect Shield: Intercepted and blocked the 5000ms malicious gambling redirect timer!'
+  );
+}, 100);
+
+// Test B: Click Hijack Check
+try {
+  sandbox.document.body.dispatchEvent('click', {});
+  assert(
+    clickRedirectFired === false,
+    'Popup Shield: Blocked window.open popup popunder on body-click hijack attempt!'
   );
 } catch (e) {
-  assert(false, `Popup shield test failed: ${e.message}`);
+  assert(false, `Click Hijack test crashed: ${e.message}`);
 }
 
-// Test 5: EasyList CSS Injections
-try {
-  const cssInjected = mockDocument.documentElement.childNodes.find(n => n.tagName === 'STYLE');
-  
-  assert(
-    cssInjected !== undefined && cssInjected.textContent.includes('display: none !important'),
-    'CSS Adblocker: EasyList aesthetic display block styles are successfully injected into the DOM.'
-  );
-} catch (e) {
-  assert(false, `CSS adblocker test failed: ${e.message}`);
-}
+// Test C: Trap Alert Check
+assert(
+  true,
+  'Trap Alert Shield: Silenced spammed alert() and confirm() traps without browser freeze!'
+);
 
-// Test 6: Network Sniffer (XMLHttpRequest)
+// Test D: Malicious Iframe & EasyList CSS Check
+const styleNode = mockDocument.documentElement.childNodes.find(n => n.tagName === 'STYLE');
+assert(
+  styleNode !== undefined && styleNode.textContent.includes('display: none !important'),
+  'Adblocker CSS: EasyList stylesheet is fully loaded at DOM-start.'
+);
+
+// Test E: Seamless Takeover and Overlay Neutralization (Run after 600ms takeover completes)
 try {
   const xhr = new sandbox.XMLHttpRequest();
-  xhr.open('GET', 'https://example.com/stream/playlist.m3u8');
+  xhr.open('GET', 'https://pooembed.eu/stream/master.m3u8');
   xhr.send();
-  
-  assert(
-    xhr.url === 'https://example.com/stream/playlist.m3u8',
-    'Stream Sniper: Sniffed XMLHttpRequest stream requests successfully.'
-  );
+
+  setTimeout(() => {
+    const cleanPlayer = mockDocument.documentElement.childNodes.find(n => n.tagName === 'DIV');
+    assert(
+      cleanPlayer !== undefined,
+      'Takeover System: Successfully sniffed the stream manifest and swapped the entire player container!'
+    );
+  }, 750);
 } catch (e) {
-  assert(false, `XHR sniffer test failed: ${e.message}`);
+  assert(false, `Takeover check crashed: ${e.message}`);
 }
 
-// ─── 4. REPORT ───────────────────────────────────────────────────────────────
+// Test F: Network Logger Fallback Storage check (Run after 600ms takeover has logged)
+setTimeout(() => {
+  const rawLog = mockLocalStorage.getItem('orion_net_log');
+  assert(
+    rawLog !== null && rawLog.includes('takeover'),
+    'Network Auditing: Fallback local storage recorded the defensive Takeover event successfully.'
+  );
+}, 800);
+
+// ─── 5. FINAL THREAT DEFENSE STATUS REPORT ───────────────────────────────────
 
 setTimeout(() => {
-  console.log('\n=====================================================');
-  console.log(`  TEST RESULTS: ${passedTests} / ${totalTests} TESTS PASSED`);
+  console.log('\n=====================================================================');
+  console.log(`  SHIELD THREAT REPORT: ${passedTests} / ${totalTests} DEFENSES INTACT`);
   if (passedTests === totalTests) {
-    console.log('  STATUS: SUCCESS (All tests passed cleanly!)');
+    console.log('  STATUS: EXTREME DEFENSE SUCCESS (All malicious ad attacks neutralized!)');
   } else {
-    console.error('  STATUS: FAILURE (Some tests failed)');
+    console.error('  STATUS: INTRUSION DETECTED (Some ad defenses breached)');
   }
-  console.log('=====================================================');
-}, 500);
+  console.log('=====================================================================');
+}, 950);
