@@ -8,7 +8,7 @@
 // @match        *://*/*
 // @run-at       document-start
 // @grant        none
-// @version      1.4
+// @version      1.5
 // @updateURL    https://raw.githubusercontent.com/ThisCrashesYouOnPhone/Script/main/script.user.js
 // @downloadURL  https://raw.githubusercontent.com/ThisCrashesYouOnPhone/Script/main/script.user.js
 // ==/UserScript==
@@ -46,6 +46,10 @@
     if (!url) return false;
     try {
       const decoded = decodeURIComponent(url);
+      
+      // Aggressive segment filtering to prevent polluting sniffedURLs with chunk paths
+      if (/(seg|chunk|ts|m4s|key|license|drm)/i.test(decoded)) return false;
+      
       const path = new URL(decoded, location.href).pathname;
       return /\.(m3u8|mpd)$/i.test(path) || /\.(m3u8|mpd)(?:\?|$)/i.test(decoded);
     } catch {
@@ -181,11 +185,12 @@
   function getBestSniffedURL() {
     const list = sniffedURLs.get(location.hostname);
     if (!list || list.length === 0) return null;
-    // Prefer master/playlist files over segments
+    
+    // Strictly prefer master/playlist files over segments and mpd if both sniffed
     const preferred = list.find(u =>
-      /master|playlist|index/i.test(u) && !u.includes('/seg') && !u.includes('.ts')
+      /\.m3u8/i.test(u) && /master|playlist|index/i.test(u)
     );
-    return preferred || list[list.length - 1];
+    return preferred || list.find(u => /\.m3u8/i.test(u)) || list[list.length - 1];
   }
 
   function isMSEVideo(video) {
@@ -371,6 +376,7 @@
     });
   }
 
+  // Forces properties to always be false to neutralize video blocker overlays
   function forcePropertyFalse(proto, prop) {
     Object.defineProperty(proto, prop, {
       configurable: true,

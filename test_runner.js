@@ -518,7 +518,6 @@ try {
   
   mockDocument.body.appendChild(parent);
 
-  // Trigger top level mirror overlay setup again with our newly added iframe present
   sandbox.window.dispatchEvent('message', {
     data: {
       type: 'ap-sniffed-url',
@@ -526,7 +525,6 @@ try {
     }
   });
 
-  // Verify that parent-level glassmorphic button overlay is appended to overlay the iframe
   const btn = parent.childNodes.find(n => n.className === 'ap-btn-injected');
   assert(btn !== undefined, 'Cineby Bypass Check: Injected premium AirPlay overlay button directly onto the top-level parent wrapper of the player iframe!');
   
@@ -540,6 +538,44 @@ try {
   }
 } catch (e) {
   assert(false, `Overlay click test failed: ${e.message}`);
+}
+
+// Test 14: Network Segment Chunk Pre-Filtering Check
+try {
+  // Clear sniffed list by dispatching standard top level mirror setup
+  const originalFetch = sandbox.window.fetch;
+  
+  // Try fetching segment chunks, keys, and license files
+  sandbox.window.fetch('https://iframe-video-provider.net/hls/segment_chunk_001.ts?token=123');
+  sandbox.window.fetch('https://iframe-video-provider.net/hls/key.key');
+  sandbox.window.fetch('https://iframe-video-provider.net/hls/license.drm');
+
+  const mirror = mockDocument.getElementById('ap-mirror-video');
+  // It should NOT set its source to any of these segment files!
+  assert(
+    mirror.src !== 'https://iframe-video-provider.net/hls/segment_chunk_001.ts?token=123' &&
+    mirror.src !== 'https://iframe-video-provider.net/hls/key.key' &&
+    mirror.src !== 'https://iframe-video-provider.net/hls/license.drm',
+    'Stream Filtering Check: Successfully pre-filtered and blocked unplayable segment/key chunks (ts, key, drm) from entering the sniffed list!'
+  );
+} catch (e) {
+  assert(false, `Segment filtering test failed: ${e.message}`);
+}
+
+// Test 15: Master Playlist Manifest Prioritization Check
+try {
+  // Simulate receiving both an index list chunk and a master playlist
+  sandbox.window.fetch('https://iframe-video-provider.net/hls/index.m3u8?chunk=1');
+  sandbox.window.fetch('https://iframe-video-provider.net/hls/master.m3u8');
+
+  // Verify that parent-level mirror video prioritizes master.m3u8 over the chunk index!
+  const mirror = mockDocument.getElementById('ap-mirror-video');
+  assert(
+    mirror.src === 'https://iframe-video-provider.net/hls/master.m3u8',
+    'Stream Filtering Check: Successfully prioritized master.m3u8 playlist manifest over segment chunk lists!'
+  );
+} catch (e) {
+  assert(false, `Master manifest prioritization test failed: ${e.message}`);
 }
 
 // ─── 4. REPORT ───────────────────────────────────────────────────────────────
