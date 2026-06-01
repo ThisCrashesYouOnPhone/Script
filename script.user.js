@@ -81,6 +81,30 @@
     }
   } catch (e) {}
 
+  // -------------------------------------------------------------------------
+  // SCREEN ORIENTATION LOCK SAFETY MOCK
+  // -------------------------------------------------------------------------
+  try {
+    if (window.screen) {
+      if (!window.screen.orientation) {
+        window.screen.orientation = {
+          lock: function () {
+            logEvent('system', '', 'SCREEN-LOCK-MOCK', 'OK', 'Mocked screen.orientation.lock("landscape") called and neutralized.');
+            return Promise.resolve();
+          },
+          unlock: function () {},
+          type: 'portrait-primary',
+          angle: 0
+        };
+      } else if (!window.screen.orientation.lock) {
+        window.screen.orientation.lock = function () {
+          logEvent('system', '', 'SCREEN-LOCK-MOCK', 'OK', 'Mocked screen.orientation.lock("landscape") called and neutralized.');
+          return Promise.resolve();
+        };
+      }
+    }
+  } catch (e) {}
+
   // Helper to detect stream URLs
   function isStreamURL(url) {
     if (!url) return false;
@@ -1121,6 +1145,32 @@
         white-space: pre-wrap;
         word-break: break-all;
       }
+      .ap-tab-btn {
+        background: transparent !important;
+        border: none !important;
+        color: #9ca3af !important;
+        font-size: 11px !important;
+        font-weight: normal !important;
+        cursor: pointer !important;
+        padding: 6px 12px !important;
+        border-bottom: 2px solid transparent !important;
+        transition: color 0.15s, border-color 0.15s !important;
+      }
+      .ap-tab-btn.active {
+        color: #10b981 !important;
+        font-weight: bold !important;
+        border-bottom: 2px solid #10b981 !important;
+      }
+      .ap-log-badge-console {
+        background: rgba(156, 163, 175, 0.15);
+        color: #9ca3af;
+        border: 1px solid rgba(156, 163, 175, 0.3);
+      }
+      .ap-log-badge-error {
+        background: rgba(239, 68, 68, 0.15);
+        color: #f87171;
+        border: 1px solid rgba(239, 68, 68, 0.3);
+      }
     `;
     (document.head || document.documentElement).appendChild(style);
 
@@ -1138,6 +1188,10 @@
       <div id="ap-log-header">
         <span id="ap-log-title">📡 WebKit Network Monitor</span>
         <button id="ap-log-close">✕</button>
+      </div>
+      <div id="ap-log-tabs" style="display:flex;background:#111827;border-bottom:1px solid rgba(255,255,255,0.06);padding:2px 8px;gap:4px;">
+        <button class="ap-tab-btn active" id="ap-tab-btn-network">📡 Network</button>
+        <button class="ap-tab-btn" id="ap-tab-btn-console">💻 Console</button>
       </div>
       <div id="ap-log-controls">
         <button class="ap-log-btn" id="ap-log-btn-airplay" style="background:rgba(16,185,129,0.15);border-color:rgba(16,185,129,0.4);color:#10b981;">📺 Inject AirPlay</button>
@@ -1158,6 +1212,23 @@
     panel.querySelector('#ap-log-btn-copy').addEventListener('click', copyLogsToClipboard);
     panel.querySelector('#ap-log-btn-har').addEventListener('click', downloadLogsHAR);
     panel.querySelector('#ap-log-btn-clear').addEventListener('click', clearLogsStorage);
+
+    const tabNet = panel.querySelector('#ap-tab-btn-network');
+    const tabCon = panel.querySelector('#ap-tab-btn-console');
+
+    tabNet.addEventListener('click', function () {
+      activeTab = 'network';
+      tabNet.classList.add('active');
+      tabCon.classList.remove('active');
+      renderLogUI();
+    });
+
+    tabCon.addEventListener('click', function () {
+      activeTab = 'console';
+      tabCon.classList.add('active');
+      tabNet.classList.remove('active');
+      renderLogUI();
+    });
 
     panel.querySelector('#ap-log-btn-airplay').addEventListener('click', function () {
       var vids = findAllVideos(document);
@@ -1216,10 +1287,14 @@
 
     logs.forEach(function (l) {
       if (l.type === 'console' || l.type === 'error') {
+        let msgStr = l.url;
+        if (l.type === 'error') {
+          msgStr = (l.status ? l.status + ' at ' : '') + l.url;
+        }
         consoleLogs.push({
           timestamp: new Date(l.timestamp).toISOString(),
           level: l.method || l.type,
-          message: l.url + (l.details ? ' | ' + l.details : '')
+          message: msgStr + (l.details ? ' | ' + l.details : '')
         });
         return;
       }
@@ -1299,6 +1374,7 @@
   }
 
   const expandedLogs = new Set();
+  let activeTab = 'network';
 
   function renderLogUI() {
     const container = document.getElementById('ap-log-container');
@@ -1307,12 +1383,20 @@
     const logs = getLocalLogs();
     container.innerHTML = '';
 
-    if (logs.length === 0) {
-      container.innerHTML = '<div style="text-align: center; color: #6b7280; font-size: 12px; margin-top: 50px;">No logs recorded yet.</div>';
+    let filteredLogs = logs;
+    if (activeTab === 'network') {
+      filteredLogs = logs.filter(function (l) { return l.type !== 'console' && l.type !== 'error'; });
+    } else if (activeTab === 'console') {
+      filteredLogs = logs.filter(function (l) { return l.type === 'console' || l.type === 'error'; });
+    }
+
+    if (filteredLogs.length === 0) {
+      const tabName = activeTab === 'network' ? 'network' : 'console';
+      container.innerHTML = '<div style="text-align: center; color: #6b7280; font-size: 12px; margin-top: 50px;">No ' + tabName + ' logs recorded yet.</div>';
       return;
     }
 
-    logs.forEach(function (log) {
+    filteredLogs.forEach(function (log) {
       const row = _origCreateElement('div');
       row.className = 'ap-log-row';
 

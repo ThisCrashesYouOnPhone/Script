@@ -63,6 +63,30 @@
     }
   } catch (e) {}
 
+  // -------------------------------------------------------------------------
+  // SCREEN ORIENTATION LOCK SAFETY MOCK
+  // -------------------------------------------------------------------------
+  try {
+    if (window.screen) {
+      if (!window.screen.orientation) {
+        window.screen.orientation = {
+          lock: function () {
+            logEvent('system', '', 'SCREEN-LOCK-MOCK', 'OK', 'Mocked screen.orientation.lock("landscape") called and neutralized.');
+            return Promise.resolve();
+          },
+          unlock: function () {},
+          type: 'portrait-primary',
+          angle: 0
+        };
+      } else if (!window.screen.orientation.lock) {
+        window.screen.orientation.lock = function () {
+          logEvent('system', '', 'SCREEN-LOCK-MOCK', 'OK', 'Mocked screen.orientation.lock("landscape") called and neutralized.');
+          return Promise.resolve();
+        };
+      }
+    }
+  } catch (e) {}
+
   // Helper to detect stream URLs
   function isStreamURL(url) {
     if (!url) return false;
