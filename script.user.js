@@ -263,27 +263,21 @@
     const list = sniffedURLs.get(host);
     if (!list.includes(url)) {
       list.push(url);
+      logEvent('hls', url, 'SNIFFED', 'ready', 'Stream URL captured. Use Force Swap button to activate AirPlay player.');
     }
 
-    // Post to other frames
+    // Notify other frames
     try {
       const msg = { type: 'ap-sniffed-url', url: url, origin: location.hostname };
-      if (window.parent && window.parent !== window) {
-        window.parent.postMessage(msg, '*');
-      }
-      if (window.top && window.top !== window) {
-        window.top.postMessage(msg, '*');
-      }
-      for (let i = 0; i < window.frames.length; i++) {
-        window.frames[i].postMessage(msg, '*');
-      }
+      if (window.parent && window.parent !== window) window.parent.postMessage(msg, '*');
+      if (window.top && window.top !== window) window.top.postMessage(msg, '*');
+      for (var i = 0; i < window.frames.length; i++) window.frames[i].postMessage(msg, '*');
     } catch (e) {}
 
-    // Process any local video elements
+    // Non-destructive: inject AirPlay attrs on existing videos without replacing them
     findAllVideos(document).forEach(tryInjectHLSSource);
-
-    // Swap if applicable
-    performNativePlayerSwap(url);
+    // NOTE: performNativePlayerSwap is NOT called automatically.
+    // Use the Force Swap button in the log panel to trigger it manually.
   }
 
   // Intercept XHR
@@ -317,22 +311,14 @@
     const method = this._sMethod || 'GET';
     const headers = this._sH || {};
     
-    // We only log "interesting" network traffic (fetch/xhr, manifest files, decryption routes) to avoid overloading storage
-    const interesting = isStreamURL(url) || /sources|decrypt|wasm|token|auth|sec|click|pop/i.test(url);
-    
-    let logId = null;
-    if (interesting) {
-      logId = logEvent('xhr', url, method, 'pending', 'Headers: ' + JSON.stringify(headers));
-    }
+    let logId = logEvent('xhr', url, method, 'pending', 'Headers: ' + JSON.stringify(headers));
 
     this.addEventListener('loadend', function () {
-      if (logId) {
         let details = 'Status: ' + self.status;
         if (isStreamURL(url) && self.responseText) {
           details += '\nManifest preview:\n' + self.responseText.slice(0, 1000);
         }
         updateLogEventStatus(logId, self.status || 200, details);
-      }
     });
 
     return _origXHRSend.call(this, body);
@@ -346,35 +332,26 @@
       const url = typeof input === 'string' ? input : ((input && input.url) ? input.url : '');
       const method = (init && init.method) || (input && input.method) || 'GET';
       const headers = (init && init.headers) || (input && input.headers) || {};
+      const t0 = Date.now();
 
-      if (isStreamURL(url)) {
-        storeStreamURL(url);
-      }
+      if (isStreamURL(url)) storeStreamURL(url);
 
-      const interesting = isStreamURL(url) || /sources|decrypt|wasm|token|auth|sec|click|pop|videasy|blirtonethe|script\.js/i.test(url);
-      
-      let logId = null;
-      if (interesting) {
-        logId = logEvent('fetch', url, method, 'pending', 'Headers: ' + JSON.stringify(headers));
-      }
+      const logId = logEvent('fetch', url, method, 'pending', 'Headers: ' + JSON.stringify(headers));
 
       return _origFetch.apply(this, arguments).then(function (res) {
-        if (logId) {
-          if (isStreamURL(url)) {
-            res.clone().text().then(function (text) {
-              updateLogEventStatus(logId, res.status, 'Status: ' + res.status + '\nManifest preview:\n' + text.slice(0, 1000));
-            }).catch(function () {
-              updateLogEventStatus(logId, res.status);
-            });
-          } else {
-            updateLogEventStatus(logId, res.status);
-          }
+        const elapsed = Date.now() - t0;
+        if (isStreamURL(url)) {
+          res.clone().text().then(function (text) {
+            updateLogEventStatus(logId, res.status, 'Status: ' + res.status + ' (' + elapsed + 'ms)\nManifest preview:\n' + text.slice(0, 1000));
+          }).catch(function () {
+            updateLogEventStatus(logId, res.status, 'Status: ' + res.status + ' (' + elapsed + 'ms)');
+          });
+        } else {
+          updateLogEventStatus(logId, res.status, 'Status: ' + res.status + ' (' + elapsed + 'ms)');
         }
         return res;
       }).catch(function (err) {
-        if (logId) {
-          updateLogEventStatus(logId, 'failed', 'Error: ' + String(err));
-        }
+        updateLogEventStatus(logId, 'failed', 'Error: ' + String(err));
         throw err;
       });
     };
@@ -386,9 +363,7 @@
     if (d && d.set) {
       Object.defineProperty(HTMLVideoElement.prototype, 'src', {
         set: function (val) {
-          if (isStreamURL(String(val))) {
-            storeStreamURL(String(val));
-          }
+          if (isStreamURL(String(val))) storeStreamURL(String(val));
           return d.set.call(this, val);
         },
         get: d.get,
@@ -396,6 +371,30 @@
       });
     }
   } catch (e) {}
+
+  // -------------------------------------------------------------------------
+  // 3b. CONSOLE & ERROR CAPTURE
+  // -------------------------------------------------------------------------
+  (function () {
+    var methods = ['log', 'warn', 'error', 'info', 'debug'];
+    methods.forEach(function (m) {
+      var orig = console[m];
+      console[m] = function () {
+        var msg = Array.prototype.slice.call(arguments).map(function (a) {
+          try { return typeof a === 'object' ? JSON.stringify(a) : String(a); } catch(e) { return String(a); }
+        }).join(' ');
+        logEvent('console', msg, m.toUpperCase(), '', '');
+        return orig.apply(console, arguments);
+      };
+    });
+  })();
+
+  window.addEventListener('error', function (e) {
+    logEvent('error', e.filename || location.href, 'JS-ERROR', e.message || 'Unknown error', 'Line ' + e.lineno + ':' + e.colno);
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    logEvent('error', location.href, 'PROMISE-ERR', 'Unhandled rejection', String(e.reason || ''));
+  });
 
   const origLoad = HTMLMediaElement.prototype.load;
   HTMLMediaElement.prototype.load = function () {
@@ -1129,12 +1128,14 @@
     panel.id = 'ap-log-panel';
     panel.innerHTML = `
       <div id="ap-log-header">
-        <span id="ap-log-title">⚙️ WebKit Network Monitor</span>
+        <span id="ap-log-title">📡 WebKit Network Monitor</span>
         <button id="ap-log-close">✕</button>
       </div>
       <div id="ap-log-controls">
-        <button class="ap-log-btn" id="ap-log-btn-copy">📋 Copy Logs</button>
-        <button class="ap-log-btn" id="ap-log-btn-download">📤 Download JSON</button>
+        <button class="ap-log-btn" id="ap-log-btn-airplay" style="background:rgba(16,185,129,0.15);border-color:rgba(16,185,129,0.4);color:#10b981;">📺 Inject AirPlay</button>
+        <button class="ap-log-btn" id="ap-log-btn-swap" style="background:rgba(251,191,36,0.12);border-color:rgba(251,191,36,0.35);color:#fbbf24;">🎯 Force Swap</button>
+        <button class="ap-log-btn" id="ap-log-btn-har">📤 Download HAR</button>
+        <button class="ap-log-btn" id="ap-log-btn-copy">📋 Copy</button>
         <button class="ap-log-btn" id="ap-log-btn-clear">🗑️ Clear</button>
         <label style="font-size: 11px; display: flex; align-items: center; gap: 4px; color: #9ca3af; margin-left: auto;">
           <input type="checkbox" id="ap-log-autoscroll" checked> Auto-scroll
@@ -1147,8 +1148,31 @@
 
     panel.querySelector('#ap-log-close').addEventListener('click', toggleLogPanel);
     panel.querySelector('#ap-log-btn-copy').addEventListener('click', copyLogsToClipboard);
-    panel.querySelector('#ap-log-btn-download').addEventListener('click', downloadLogsJSON);
+    panel.querySelector('#ap-log-btn-har').addEventListener('click', downloadLogsHAR);
     panel.querySelector('#ap-log-btn-clear').addEventListener('click', clearLogsStorage);
+
+    panel.querySelector('#ap-log-btn-airplay').addEventListener('click', function () {
+      var vids = findAllVideos(document);
+      vids.forEach(function (v) { cleanBlockedAttributes(v); });
+      var count = vids.length;
+      logEvent('system', location.href, 'AIRPLAY-INJECT', count > 0 ? 'OK' : 'NO-VIDEOS', 'Injected AirPlay attrs on ' + count + ' video element(s)');
+      var btn = document.getElementById('ap-log-btn-airplay');
+      if (btn) { btn.textContent = '✅ Done (' + count + ')'; setTimeout(function(){ btn.textContent = '📺 Inject AirPlay'; }, 2000); }
+    });
+
+    panel.querySelector('#ap-log-btn-swap').addEventListener('click', function () {
+      var url = getBestSniffedURL();
+      if (!url) {
+        logEvent('system', '', 'SWAP', 'NO-URL', 'No stream URL sniffed yet. Play a video first.');
+        var btn = document.getElementById('ap-log-btn-swap');
+        if (btn) { btn.textContent = '⚠️ No URL yet'; setTimeout(function(){ btn.textContent = '🎯 Force Swap'; }, 2000); }
+        return;
+      }
+      logEvent('system', url, 'SWAP', 'MANUAL', 'Manual Force Swap triggered by user.');
+      performNativePlayerSwap(url);
+      var btn = document.getElementById('ap-log-btn-swap');
+      if (btn) { btn.textContent = '✅ Swapped!'; setTimeout(function(){ btn.textContent = '🎯 Force Swap'; }, 2000); }
+    });
 
     renderLogUI();
   }
@@ -1176,21 +1200,88 @@
     });
   }
 
-  function downloadLogsJSON() {
-    const btn = document.getElementById('ap-log-btn-download');
-    const logs = getLocalLogs();
-    const blob = new Blob([JSON.stringify(logs, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    
-    const a = _origCreateElement('a');
+  function downloadLogsHAR() {
+    var btn = document.getElementById('ap-log-btn-har');
+    var logs = getLocalLogs();
+    var networkEntries = [];
+    var consoleLogs = [];
+
+    logs.forEach(function (l) {
+      if (l.type === 'console' || l.type === 'error') {
+        consoleLogs.push({
+          timestamp: new Date(l.timestamp).toISOString(),
+          level: l.method || l.type,
+          message: l.url + (l.details ? ' | ' + l.details : '')
+        });
+        return;
+      }
+      if (l.type !== 'xhr' && l.type !== 'fetch' && l.type !== 'hls') return;
+
+      // Parse status
+      var status = parseInt(l.status, 10);
+      if (isNaN(status)) status = 0;
+
+      networkEntries.push({
+        startedDateTime: new Date(l.timestamp).toISOString(),
+        time: -1,
+        request: {
+          method: l.method || 'GET',
+          url: l.url,
+          httpVersion: 'HTTP/1.1',
+          headers: [],
+          queryString: [],
+          cookies: [],
+          headersSize: -1,
+          bodySize: -1
+        },
+        response: {
+          status: status,
+          statusText: String(l.status),
+          httpVersion: 'HTTP/1.1',
+          headers: [],
+          cookies: [],
+          content: {
+            size: -1,
+            mimeType: isStreamURL(l.url) ? 'application/x-mpegURL' : 'application/octet-stream',
+            text: l.details || ''
+          },
+          redirectURL: '',
+          headersSize: -1,
+          bodySize: -1
+        },
+        cache: {},
+        timings: { send: 0, wait: -1, receive: -1 }
+      });
+    });
+
+    var har = {
+      log: {
+        version: '1.2',
+        creator: { name: 'AP WebKit Logger', version: '3.1', comment: 'Captured on ' + location.hostname },
+        pages: [{
+          startedDateTime: logs.length > 0 ? new Date(logs[0].timestamp).toISOString() : new Date().toISOString(),
+          id: 'page_1',
+          title: document.title || location.href,
+          pageTimings: {}
+        }],
+        entries: networkEntries,
+        _consoleLogs: consoleLogs,
+        _capturedAt: new Date().toISOString(),
+        _pageUrl: location.href
+      }
+    };
+
+    var blob = new Blob([JSON.stringify(har, null, 2)], { type: 'application/json' });
+    var url = URL.createObjectURL(blob);
+    var a = _origCreateElement('a');
     a.href = url;
-    a.download = 'webkit-network-log-' + Date.now() + '.json';
+    a.download = 'webkit-capture-' + Date.now() + '.har';
     a.click();
     URL.revokeObjectURL(url);
 
     if (btn) {
       btn.textContent = '✅ Downloaded';
-      setTimeout(function () { btn.textContent = '📤 Download JSON'; }, 2000);
+      setTimeout(function () { btn.textContent = '📤 Download HAR'; }, 2000);
     }
   }
 
