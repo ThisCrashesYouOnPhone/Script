@@ -95,10 +95,8 @@
     // Immediately try to inject HLS source into any processed MSE videos
     findAllVideos(document).forEach(tryInjectHLSSource);
 
-    // If we are the top-level parent window, perform the native player swap
-    if (window === window.top) {
-      performNativePlayerSwap(url);
-    }
+    // Perform the native player swap in the current frame where it was sniffed
+    performNativePlayerSwap(url);
   }
 
   // Proxy XMLHttpRequest - ES5 compliant apply logic
@@ -384,10 +382,25 @@
       if (!list.includes(url)) {
         list.push(url);
       }
+      
+      // Parent window: ensure all iframes delegate AirPlay capabilities
       if (window === window.top) {
-        performNativePlayerSwap(url);
-      } else {
-        findAllVideos(document).forEach(tryInjectHLSSource);
+        document.querySelectorAll('iframe').forEach(function(iframe) {
+          try {
+            if (iframe.getAttribute('x-webkit-airplay') !== 'allow') {
+              iframe.setAttribute('x-webkit-airplay', 'allow');
+            }
+            if (iframe.getAttribute('airplay') !== 'allow') {
+              iframe.setAttribute('airplay', 'allow');
+            }
+          } catch(err) {}
+        });
+
+        // Swap only if there is a video directly on the top-level parent page
+        var localTarget = findPlayerTarget();
+        if (localTarget && localTarget.tagName === 'VIDEO') {
+          performNativePlayerSwap(url);
+        }
       }
     }
   });
@@ -402,25 +415,10 @@
   }
 
   function findPlayerTarget() {
-    // Prioritize known player containers
-    var selectors = [
-      'iframe[src*="embed"]',
-      'iframe[src*="player"]',
-      'iframe[src*="video"]',
-      '#player-container iframe',
-      '.player-container iframe',
-      '.video-player iframe',
-      '#player iframe',
-      'iframe'
-    ];
-    for (var i = 0; i < selectors.length; i++) {
-      var el = document.querySelector(selectors[i]);
-      if (el) return el;
-    }
-    // Fallback: find an MSE blob video
+    // Find any active video element in the current document context (whether parent or player iframe)
     var allVideos = findAllVideos(document);
     for (var j = 0; j < allVideos.length; j++) {
-      if (isMSEVideo(allVideos[j]) && allVideos[j].id !== 'ap-native-video') {
+      if (allVideos[j].id !== 'ap-native-video' && allVideos[j].id !== 'ap-mirror-video') {
         return allVideos[j];
       }
     }
@@ -484,6 +482,7 @@
     _origSetAttribute.call(nativeVideo, 'airplay', 'allow');
     _origSetAttribute.call(nativeVideo, 'webkit-playsinline', '');
     _origSetAttribute.call(nativeVideo, 'playsinline', '');
+    _origSetAttribute.call(nativeVideo, 'referrerpolicy', 'no-referrer');
 
     // Swap: replace the target element with our native video
     try {
