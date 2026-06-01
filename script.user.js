@@ -240,36 +240,8 @@
   }
 
   // -------------------------------------------------------------------------
-  // MODULE 4 - CLONE + REINSERT (fixes post-render attribute problem)
+  // MODULE 4 - DIRECT ATTRIBUTE RE-EVALUATION
   // -------------------------------------------------------------------------
-
-  function cloneAndReinsert(video) {
-    if (!video.parentNode) return video;
-
-    const currentTime = video.currentTime;
-    const wasPaused   = video.paused;
-    const muted       = video.muted;
-    const volume      = video.volume;
-    const playbackRate = video.playbackRate;
-
-    const clone = video.cloneNode(true);
-    clone.setAttribute('x-webkit-airplay', 'allow');
-    clone.setAttribute('airplay', 'allow');
-    if (clone.hasAttribute('disableremoteplayback')) clone.removeAttribute('disableremoteplayback');
-    if (clone.hasAttribute('x-webkit-wireless-video-playback-disabled')) clone.removeAttribute('x-webkit-wireless-video-playback-disabled');
-
-    video.parentNode.replaceChild(clone, video);
-
-    clone.currentTime  = currentTime;
-    clone.muted        = muted;
-    clone.volume       = volume;
-    clone.playbackRate = playbackRate;
-    if (!wasPaused) {
-      clone.play().catch(function () {});
-    }
-
-    return clone;
-  }
 
   // -------------------------------------------------------------------------
   // MODULE 5 - AIRPLAY BUTTON OVERLAY (Premium Glassmorphism Style)
@@ -586,10 +558,8 @@
       if (currentAttr === 'allow') {
         // Already allowed
       } else if (video.isConnected && video.readyState > 0) {
-        const newVideo = cloneAndReinsert(video);
-        processedVideos.add(newVideo);
-        injectAirPlayButton(newVideo);
-        return;
+        video.setAttribute('x-webkit-airplay', 'allow');
+        video.setAttribute('airplay', 'allow');
       } else {
         video.setAttribute('x-webkit-airplay', 'allow');
         video.setAttribute('airplay', 'allow');
