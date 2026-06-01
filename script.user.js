@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         Universal AirPlay Enabler
 // @description  Enables full AirPlay video (not just audio) on all websites.
-//               Sniffs HLS/m3u8 URLs from MSE players, injects them as a
-//               secondary source so WebKit can hand them to AirPlay, handles
-//               the clone-reinsert trick for post-render attribute injection,
-//               and overlays a dedicated AirPlay button on every video.
+//               Sniffs HLS/m3u8 URLs from MSE players, then performs a full
+//               Native Player Swap: replaces the site's custom player iframe
+//               with a top-level native <video> element so WebKit's AirPlay
+//               works fully (video + audio) rather than audio-only.
 // @match        *://*/*
 // @run-at       document-start
 // @grant        none
-// @version      1.6
+// @version      2.0
 // @updateURL    https://raw.githubusercontent.com/ThisCrashesYouOnPhone/Script/main/script.user.js
 // @downloadURL  https://raw.githubusercontent.com/ThisCrashesYouOnPhone/Script/main/script.user.js
 // ==/UserScript==
@@ -81,9 +81,9 @@
     // Immediately try to inject HLS source into any processed MSE videos
     findAllVideos(document).forEach(tryInjectHLSSource);
 
-    // If we are the top-level parent window, set up top-level mirroring immediately
+    // If we are the top-level parent window, perform the native player swap
     if (window === window.top) {
-      setupTopLevelMirror(url);
+      performNativePlayerSwap(url);
     }
   }
 
@@ -373,117 +373,148 @@
   }
 
   // -------------------------------------------------------------------------
-  // 7. CROSS-FRAME MESSAGE LISTENER & MIRROR VIDEO SYSTEMS
+  // 7. CROSS-FRAME MESSAGE LISTENER & NATIVE PLAYER SWAP
+  //
+  // When a stream URL is sniffed (either in the top frame or relayed from
+  // a child iframe), we perform a "Native Player Swap":
+  //   1. Find the player container or iframe in the top-level DOM
+  //   2. Record its dimensions + position so we can replace it perfectly
+  //   3. Destroy the iframe / custom player element
+  //   4. Insert a fully-visible native <video> element with AirPlay enabled
+  //
+  // This gives WebKit a top-level, same-origin <video> element it can hand
+  // off to AirPlay with full video+audio — no more audio-only casting.
   // -------------------------------------------------------------------------
-  
+
+  // Guard: only swap once per page load
+  var _swapDone = false;
+
   window.addEventListener('message', function (e) {
     if (e.data && e.data.type === 'ap-sniffed-url' && e.data.url) {
-      const url = e.data.url;
-      const host = location.hostname;
+      var url = e.data.url;
+      var host = location.hostname;
       if (!sniffedURLs.has(host)) sniffedURLs.set(host, []);
-      const list = sniffedURLs.get(host);
+      var list = sniffedURLs.get(host);
       if (!list.includes(url)) {
         list.push(url);
-        
-        if (window === window.top) {
-          setupTopLevelMirror(url);
-        } else {
-          findAllVideos(document).forEach(tryInjectHLSSource);
-        }
+      }
+      if (window === window.top) {
+        performNativePlayerSwap(url);
+      } else {
+        findAllVideos(document).forEach(tryInjectHLSSource);
       }
     }
   });
 
-  function setupTopLevelMirror(streamURL) {
-    let mirrorVideo = document.getElementById('ap-mirror-video');
-    if (!mirrorVideo) {
-      mirrorVideo = _origCreateElement('video');
-      mirrorVideo.id = 'ap-mirror-video';
-      mirrorVideo.style.cssText = 'position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; z-index: -1000;';
-      mirrorVideo.setAttribute('x-webkit-airplay', 'allow');
-      mirrorVideo.setAttribute('airplay', 'allow');
-      document.body.appendChild(mirrorVideo);
-    }
-    
-    if (mirrorVideo.src !== streamURL) {
-      mirrorVideo.src = streamURL;
-      if (typeof mirrorVideo.load === 'function') mirrorVideo.load();
-    }
-
-    // Attempt to overlay button right over target iframe player
-    const targetIframe = findTargetIframe();
-    if (targetIframe) {
-      injectTopLevelAirPlayButton(targetIframe, mirrorVideo);
+  // Also trigger swap when we sniff a URL in the top frame directly
+  var _origStoreStreamURL = storeStreamURL;
+  function storeStreamURLAndMaybeSwap(url) {
+    _origStoreStreamURL(url);
+    if (window === window.top && isStreamURL(url)) {
+      performNativePlayerSwap(url);
     }
   }
 
-  function findTargetIframe() {
-    return document.querySelector('iframe[src*="embed"], iframe[src*="player"], iframe[src*="video"]') || 
-           document.querySelector('iframe');
-  }
-
-  function injectTopLevelAirPlayButton(iframe, mirrorVideo) {
-    const wrapper = iframe.parentNode;
-    if (!wrapper) return;
-    if (wrapper.querySelector('.ap-btn-injected')) return;
-
-    const wrapStyle = window.getComputedStyle(wrapper).position;
-    if (wrapStyle === 'static') wrapper.style.position = 'relative';
-
-    const btn = _origCreateElement('button');
-    btn.className = 'ap-btn-injected';
-    btn.title     = 'AirPlay video';
-    btn.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 17H3a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h18a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-2"/><polygon points="12 15 17 21 7 21 12 15"/></svg>';
-    
-    btn.style.cssText = 'position: absolute; bottom: 24px; right: 24px; z-index: 2147483647; width: 38px; height: 38px; background: rgba(18, 18, 18, 0.70); color: #ffffff; border: 1px solid rgba(255, 255, 255, 0.2); border-radius: 50%; cursor: pointer; display: none; align-items: center; justify-content: center; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3); transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); line-height: 0; outline: none; pointer-events: auto !important;';
-
-    btn.addEventListener('mouseenter', function () {
-      btn.style.transform = 'scale(1.08)';
-      btn.style.background = 'rgba(30, 30, 30, 0.85)';
-      btn.style.borderColor = 'rgba(255, 255, 255, 0.35)';
-    });
-    btn.addEventListener('mouseleave', function () {
-      btn.style.transform = 'scale(1)';
-      btn.style.background = 'rgba(18, 18, 18, 0.70)';
-      btn.style.borderColor = 'rgba(255, 255, 255, 0.2)';
-    });
-    btn.addEventListener('mousedown', function () {
-      btn.style.transform = 'scale(0.95)';
-    });
-    btn.addEventListener('mouseup', function () {
-      btn.style.transform = 'scale(1.08)';
-    });
-
-    btn.addEventListener('click', function (e) {
-      e.stopPropagation();
-      e.preventDefault();
-      
-      // time syncing
-      try {
-        const iframeVideo = iframe.contentDocument && iframe.contentDocument.querySelector('video');
-        if (iframeVideo) {
-          mirrorVideo.currentTime = iframeVideo.currentTime;
-        }
-      } catch (err) {}
-
-      mirrorVideo.webkitShowPlaybackTargetPicker();
-    });
-
-    const show = function () { btn.style.display = 'flex'; };
-    const hide = function () { btn.style.display = 'none'; };
-
-    iframe.addEventListener('mouseenter', show);
-    iframe.addEventListener('mouseleave', hide);
-
-    mirrorVideo.addEventListener('webkitplaybacktargetavailabilitychanged', function (e) {
-      if (e.availability === 'available') {
-        show();
-      } else {
-        hide();
+  function findPlayerTarget() {
+    // Prioritize known player containers
+    var selectors = [
+      'iframe[src*="embed"]',
+      'iframe[src*="player"]',
+      'iframe[src*="video"]',
+      '#player-container iframe',
+      '.player-container iframe',
+      '.video-player iframe',
+      '#player iframe',
+      'iframe'
+    ];
+    for (var i = 0; i < selectors.length; i++) {
+      var el = document.querySelector(selectors[i]);
+      if (el) return el;
+    }
+    // Fallback: find an MSE blob video
+    var allVideos = findAllVideos(document);
+    for (var j = 0; j < allVideos.length; j++) {
+      if (isMSEVideo(allVideos[j]) && allVideos[j].id !== 'ap-native-video') {
+        return allVideos[j];
       }
-    });
+    }
+    return null;
+  }
 
-    wrapper.appendChild(btn);
+  function performNativePlayerSwap(streamURL) {
+    if (_swapDone) {
+      // Already swapped — just update the src if URL changed
+      var existing = document.getElementById('ap-native-video');
+      if (existing && existing.src !== streamURL) {
+        existing.src = streamURL;
+        if (typeof existing.load === 'function') existing.load();
+        existing.play().catch(function () {});
+      }
+      return;
+    }
+
+    var target = findPlayerTarget();
+    if (!target) {
+      // No player found yet — wait and retry
+      setTimeout(function () { performNativePlayerSwap(streamURL); }, 500);
+      return;
+    }
+
+    _swapDone = true;
+
+    // Capture dimensions from the target element or its container
+    var container = target.parentNode;
+    if (!container) return;
+
+    var rect = target.getBoundingClientRect ? target.getBoundingClientRect() : null;
+    var width  = target.offsetWidth  || (rect && rect.width)  || 640;
+    var height = target.offsetHeight || (rect && rect.height) || 360;
+
+    // Remember playback time if it's a video (not an iframe)
+    var savedTime = 0;
+    if (target.tagName === 'VIDEO' && !isNaN(target.currentTime)) {
+      savedTime = target.currentTime;
+    }
+
+    // Build native video element
+    var nativeVideo = _origCreateElement('video');
+    nativeVideo.id            = 'ap-native-video';
+    nativeVideo.controls      = true;
+    nativeVideo.autoplay      = true;
+    nativeVideo.playsInline   = true;
+    nativeVideo.src           = streamURL;
+    nativeVideo.currentTime   = savedTime;
+    nativeVideo.style.cssText = [
+      'display: block',
+      'width: ' + (width  ? width  + 'px' : '100%'),
+      'height: ' + (height ? height + 'px' : '100%'),
+      'max-width: 100%',
+      'background: #000',
+      'border-radius: inherit',
+      'outline: none'
+    ].join(';');
+
+    _origSetAttribute.call(nativeVideo, 'x-webkit-airplay', 'allow');
+    _origSetAttribute.call(nativeVideo, 'airplay', 'allow');
+    _origSetAttribute.call(nativeVideo, 'webkit-playsinline', '');
+    _origSetAttribute.call(nativeVideo, 'playsinline', '');
+
+    // Swap: replace the target element with our native video
+    try {
+      container.replaceChild(nativeVideo, target);
+    } catch (replaceErr) {
+      // Fallback: append after
+      target.style.display = 'none';
+      container.appendChild(nativeVideo);
+    }
+
+    nativeVideo.play().catch(function () {});
+
+    // Inject AirPlay button onto the native video
+    processedVideos.delete(nativeVideo); // ensure it gets processed fresh
+    processVideo(nativeVideo);
+
+    console.log('[AirPlay Enabler] Native player swap complete. Stream:', streamURL);
   }
 
   // -------------------------------------------------------------------------
