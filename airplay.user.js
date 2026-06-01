@@ -48,6 +48,7 @@
   const _origFetch         = window.fetch ? window.fetch.bind(window) : null;
   const _origXHROpen       = XMLHttpRequest.prototype.open;
   const _origXHRSend       = XMLHttpRequest.prototype.send;
+  const _origXHRSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
   const _origAttachShadow  = Element.prototype.attachShadow;
   const _origSetAttribute  = Element.prototype.setAttribute;
   const _origRemoveAttribute = Element.prototype.removeAttribute;
@@ -73,6 +74,13 @@
     } catch (e) {
       return /\.(m3u8|mpd)(?:\?|$)/i.test(url);
     }
+  }
+
+  // Helper to determine if we should capture and log response bodies
+  function shouldCaptureBody(url) {
+    if (!url) return false;
+    if (isStreamURL(url)) return true;
+    return /sources/i.test(url) || /sources-with-title/i.test(url);
   }
 
   // -------------------------------------------------------------------------
@@ -289,9 +297,7 @@
     if (this._sH) {
       this._sH[name] = value;
     }
-    return _origXHROpen.prototype.setRequestHeader ? 
-      _origXHROpen.prototype.setRequestHeader.call(this, name, value) : 
-      XMLHttpRequest.prototype.setRequestHeader.call(this, name, value);
+    return _origXHRSetRequestHeader.call(this, name, value);
   };
 
   XMLHttpRequest.prototype.send = function (body) {
@@ -311,8 +317,9 @@
     this.addEventListener('loadend', function () {
       if (logId) {
         let details = 'Status: ' + self.status;
-        if (isStreamURL(url) && self.responseText) {
-          details += '\nManifest preview:\n' + self.responseText.slice(0, 1000);
+        if (shouldCaptureBody(url) && self.responseText) {
+          const typeLabel = isStreamURL(url) ? 'Manifest preview' : 'Response body';
+          details += '\n' + typeLabel + ':\n' + self.responseText.slice(0, 10000);
         }
         updateLogEventStatus(logId, self.status || 200, details);
       }
@@ -343,9 +350,10 @@
 
       return _origFetch.apply(this, arguments).then(function (res) {
         if (logId) {
-          if (isStreamURL(url)) {
+          if (shouldCaptureBody(url)) {
             res.clone().text().then(function (text) {
-              updateLogEventStatus(logId, res.status, 'Status: ' + res.status + '\nManifest preview:\n' + text.slice(0, 1000));
+              const typeLabel = isStreamURL(url) ? 'Manifest preview' : 'Response body';
+              updateLogEventStatus(logId, res.status, 'Status: ' + res.status + '\n' + typeLabel + ':\n' + text.slice(0, 10000));
             }).catch(function () {
               updateLogEventStatus(logId, res.status);
             });
