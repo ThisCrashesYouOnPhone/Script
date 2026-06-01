@@ -6,6 +6,12 @@
 //               with a top-level native <video> element so WebKit's AirPlay
 //               works fully (video + audio) rather than audio-only.
 // @match        *://*/*
+// @match        http://localhost/*
+// @match        http://localhost:*/*
+// @match        http://127.0.0.1/*
+// @match        http://127.0.0.1:*/*
+// @match        http://10.*/*
+// @match        http://192.168.*/*
 // @run-at       document-start
 // @grant        none
 // @version      2.0
@@ -15,6 +21,14 @@
 
 (function () {
   'use strict';
+
+  // Flag that the Universal AirPlay Enabler is active
+  window.__universalAirPlayEnablerActive = true;
+  try {
+    if (document.documentElement) {
+      document.documentElement.setAttribute('data-airplay-enabler-active', 'true');
+    }
+  } catch (e) {}
 
   // -------------------------------------------------------------------------
   // STATE

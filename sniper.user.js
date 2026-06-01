@@ -2,6 +2,12 @@
 // @name         Orion Stream Sniper
 // @namespace    orion-stack
 // @match        *://*/*
+// @match        http://localhost/*
+// @match        http://localhost:*/*
+// @match        http://127.0.0.1/*
+// @match        http://127.0.0.1:*/*
+// @match        http://10.*/*
+// @match        http://192.168.*/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @run-at       document-start
@@ -13,11 +19,23 @@
 (function() {
   'use strict';
 
+  // Flag that the Orion Stream Sniper is active
+  window.__orionStreamSniperActive = true;
+  try {
+    if (document.documentElement) {
+      document.documentElement.setAttribute('data-stream-sniper-active', 'true');
+    }
+  } catch (e) {}
+
   const SNIPE_HOSTS = [
     'pooembed.eu',
     'embedsports.top',
     'embedhd.org',
     'exposestrat.com',
+    'localhost',
+    '127.0.0.1',
+    '10.0.0.120',
+    '192.168.'
   ];
 
   if (!SNIPE_HOSTS.some(function (h) { return location.hostname.includes(h); })) return;
