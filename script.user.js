@@ -1,16 +1,14 @@
 // ==UserScript==
 // @name         Universal AirPlay & Stream Sniper
-// @description  Universal AirPlay enabler, ad shields, same-origin iframe swap, and persistent WebKit network monitor.
+// @description  Universal AirPlay enabler + stream sniffer. Works on any streaming site. Auto-activates ad shields when hostile behavior is detected.
 // @match        *://*/*
-// @match        http://localhost/*
-// @match        http://localhost:*/*
-// @match        http://127.0.0.1/*
-// @match        http://127.0.0.1:*/*
-// @match        http://10.*/*
-// @match        http://192.168.*/*
+// @include      /^https?:\/\/localhost(:[0-9]+)?\/.*/
+// @include      /^https?:\/\/127\.0\.0\.1(:[0-9]+)?\/.*/
+// @include      /^https?:\/\/10\..*/
+// @include      /^https?:\/\/192\.168\..*/
 // @run-at       document-start
 // @grant        none
-// @version      3.0
+// @version      3.1
 // @updateURL    https://raw.githubusercontent.com/ThisCrashesYouOnPhone/Script/main/script.user.js
 // @downloadURL  https://raw.githubusercontent.com/ThisCrashesYouOnPhone/Script/main/script.user.js
 // ==/UserScript==
@@ -21,20 +19,40 @@
   // -------------------------------------------------------------------------
   // 1. CONFIGURATION & SCOPE SETUP
   // -------------------------------------------------------------------------
-  const SNIPE_HOSTS = [
+  // SAFE_HOSTS: Never auto-activate aggressive shields here (trusted sites).
+  // The core (AirPlay enforcement + network interceptor + logger) still runs everywhere.
+  const SAFE_HOSTS = [
+    'youtube.com', 'youtu.be',
+    'netflix.com', 'hulu.com', 'disneyplus.com', 'max.com', 'primevideo.com',
+    'twitch.tv', 'vimeo.com', 'dailymotion.com',
+    'google.com', 'github.com', 'stackoverflow.com',
+    'cineby.sc',    // top-level Cineby page — shields would break the native AirPlay picker
+  ];
+
+  // KNOWN_SHIELD_HOSTS: Always activate shields here regardless of behavior detection.
+  // Add any embed/player host you know is hostile.
+  const KNOWN_SHIELD_HOSTS = [
+    'videasy.net',
+    'blirtonethe.com',
     'pooembed.eu',
     'embedsports.top',
     'embedhd.org',
     'exposestrat.com',
+    'onandasmilee.com',
+    'top-toones.com',
+    'boomerang-bet.com',
+    'bonusandspins.com',
+    'adcash.com',
     'localhost',
     '127.0.0.1',
-    '10.0.0.120',
-    '192.168.'
   ];
 
-  const onEmbedHost = SNIPE_HOSTS.some(function (h) {
-    return location.hostname.includes(h);
-  });
+  const isSafeHost = SAFE_HOSTS.some(function (h) { return location.hostname.includes(h); });
+  const isKnownShieldHost = KNOWN_SHIELD_HOSTS.some(function (h) { return location.hostname.includes(h); });
+
+  // shieldsActive: starts false, flips to true either because we're on a known
+  // hostile host, or because hostile behavior is auto-detected at runtime.
+  let shieldsActive = isKnownShieldHost && !isSafeHost;
 
   const isTopFrame = (window.self === window.top);
   const startTime = Date.now();
@@ -333,7 +351,7 @@
         storeStreamURL(url);
       }
 
-      const interesting = isStreamURL(url) || /sources|decrypt|wasm|token|auth|sec|click|pop/i.test(url);
+      const interesting = isStreamURL(url) || /sources|decrypt|wasm|token|auth|sec|click|pop|videasy|blirtonethe|script\.js/i.test(url);
       
       let logId = null;
       if (interesting) {
@@ -390,10 +408,23 @@
   // -------------------------------------------------------------------------
   // 4. AD & REDIRECT SHIELDS (SNIPER PROTECTIONS)
   // -------------------------------------------------------------------------
-  if (onEmbedHost) {
-    logEvent('system', '', 'SHIELD', 'ACTIVE', 'Ad-blocking sniper shields activated for ' + location.hostname);
+  // Shields activate when: (a) on a KNOWN_SHIELD_HOST, OR (b) hostile behavior
+  // is auto-detected at runtime (window.open called, long timers fired, etc.)
+  // They NEVER activate on SAFE_HOSTS.
 
-    // Timeout & Interval filters
+  function activateShields() {
+    if (shieldsActive || isSafeHost) return; // already on or suppressed
+    shieldsActive = true;
+    logEvent('system', location.hostname, 'SHIELD', 'AUTO-ACTIVATED', 'Hostile behavior detected — shields auto-activated.');
+  }
+
+  if (!isSafeHost) {
+    if (shieldsActive) {
+      logEvent('system', '', 'SHIELD', 'ACTIVE', 'Ad-blocking sniper shields active (known host): ' + location.hostname);
+    }
+
+    // Timeout & Interval filters — run on all non-safe hosts.
+    // Long-delay timers (>3s) are a hallmark of redirect ad attacks.
     const _realSetTimeout = window.setTimeout.bind(window);
     const _realSetInterval = window.setInterval.bind(window);
     const _realClearTimeout = window.clearTimeout.bind(window);
@@ -408,8 +439,11 @@
     window.setTimeout = function (fn, delay) {
       const numDelay = Number(delay) || 0;
       if (numDelay > 3000) {
-        logEvent('blocked', 'Timeout blocked', 'TIMER', 'BLOCKED', 'Delay: ' + numDelay + 'ms | Function: ' + (fn && fn.name ? fn.name : 'anonymous'));
-        return 0;
+        activateShields(); // a long timer is suspicious — pre-arm shields
+        if (shieldsActive) {
+          logEvent('blocked', 'Timeout blocked', 'TIMER', 'BLOCKED', 'Delay: ' + numDelay + 'ms | Function: ' + (fn && fn.name ? fn.name : 'anonymous'));
+          return 0;
+        }
       }
       return _realSetTimeout.apply(window, arguments);
     };
@@ -417,8 +451,11 @@
     window.setInterval = function (fn, delay) {
       const numDelay = Number(delay) || 0;
       if (numDelay > 3000) {
-        logEvent('blocked', 'Interval blocked', 'TIMER', 'BLOCKED', 'Delay: ' + numDelay + 'ms | Function: ' + (fn && fn.name ? fn.name : 'anonymous'));
-        return 0;
+        activateShields();
+        if (shieldsActive) {
+          logEvent('blocked', 'Interval blocked', 'TIMER', 'BLOCKED', 'Delay: ' + numDelay + 'ms | Function: ' + (fn && fn.name ? fn.name : 'anonymous'));
+          return 0;
+        }
       }
       return _realSetInterval.apply(window, arguments);
     };
@@ -438,24 +475,31 @@
       }
     }, 600);
 
-    // Block Popups
+    // Block Popups — auto-activate shields on first window.open call (it's always hostile)
     const _realOpen = window.open;
     window.open = function (url) {
-      logEvent('blocked', url, 'POPUP', 'BLOCKED', 'Blocked window.open attempt.');
-      return {
-        focus: function () {},
-        close: function () {},
-        closed: true
-      };
+      activateShields();
+      if (shieldsActive) {
+        logEvent('blocked', url, 'POPUP', 'BLOCKED', 'Blocked window.open attempt.');
+        return { focus: function () {}, close: function () {}, closed: true };
+      }
+      return _realOpen.apply(window, arguments);
     };
 
-    // Block Alerts & Confirms (prevents traps)
+    // Block Alerts & Confirms — auto-activate shields on first alert/confirm
     window.alert = function (msg) {
-      logEvent('blocked', 'Alert silenced', 'ALERT', 'SILENCED', msg);
+      activateShields();
+      if (shieldsActive) {
+        logEvent('blocked', 'Alert silenced', 'ALERT', 'SILENCED', msg);
+        return;
+      }
     };
     window.confirm = function (msg) {
-      logEvent('blocked', 'Confirm silenced', 'CONFIRM', 'SILENCED', msg);
-      return true;
+      activateShields();
+      if (shieldsActive) {
+        logEvent('blocked', 'Confirm silenced', 'CONFIRM', 'SILENCED', msg);
+        return true;
+      }
     };
 
     // EasyList CSS block
@@ -482,7 +526,7 @@
       const name = fn ? fn.name : 'anonymous';
       const isRedirectType = ['click', 'mousedown', 'touchend'].includes(type);
 
-      if (isRedirectType) {
+      if (isRedirectType && shieldsActive) {
         if (isObfuscatedFn(name)) {
           logEvent('blocked', 'Obfuscated listener', type.toUpperCase(), 'NEUTRALIZED', 'Function: ' + name);
           return;
@@ -500,8 +544,9 @@
       return _origAddEventListener.call(this, type, fn, opts);
     };
 
-    // Block untrusted link navigations
+    // Block untrusted link navigations (only when shields are active)
     document.addEventListener('click', function (e) {
+      if (!shieldsActive) return;
       const anchor = e.target.closest('a');
       if (!anchor) return;
       const href = anchor.href || '';
@@ -515,25 +560,27 @@
       }
     }, true);
 
-    // Block .click() on HTMLElement
+    // Block .click() on HTMLElement (only when shields active)
     const _origClick = HTMLElement.prototype.click;
     HTMLElement.prototype.click = function () {
-      const anchor = this.closest ? this.closest('a') : null;
-      if (anchor) {
-        const href = anchor.href || '';
-        const isExternal = href && !href.startsWith(location.origin) && !/^(javascript|#|data):/.test(href);
-        if (isExternal) {
-          logEvent('blocked', href, 'HTMLElement.click()', 'BLOCKED', 'Blocked programmatic click redirection.');
-          return;
+      if (shieldsActive) {
+        const anchor = this.closest ? this.closest('a') : null;
+        if (anchor) {
+          const href = anchor.href || '';
+          const isExternal = href && !href.startsWith(location.origin) && !/^(javascript|#|data):/.test(href);
+          if (isExternal) {
+            logEvent('blocked', href, 'HTMLElement.click()', 'BLOCKED', 'Blocked programmatic click redirection.');
+            return;
+          }
         }
       }
       return _origClick.call(this);
     };
 
-    // Block Form redirects
+    // Block Form redirects (only when shields active)
     const _origSubmit = HTMLFormElement.prototype.submit;
     HTMLFormElement.prototype.submit = function () {
-      if (['_blank', '_top'].includes(this.target)) {
+      if (shieldsActive && ['_blank', '_top'].includes(this.target)) {
         logEvent('blocked', this.action || location.href, 'FORM-SUBMIT', 'BLOCKED', 'Blocked programmatic form submit target redirect.');
         return;
       }
@@ -552,8 +599,9 @@
       });
     }).observe(document.documentElement || document, { childList: true, subtree: true });
 
-    // Embed-domain anchor mousedown block
+    // Embed-domain anchor mousedown block (only when shields active)
     document.addEventListener('mousedown', function (e) {
+      if (!shieldsActive) return;
       const anchor = e.target.closest('a');
       if (anchor) {
         logEvent('blocked', anchor.href, 'MOUSEDOWN', 'BLOCKED', 'Blocked mousedown click-jacking on link.');
@@ -564,7 +612,11 @@
 
     // Surgical iframe sandboxing
     const AD_IFRAME_PATTERNS = ['/ad.html', 'adcash.com', 'top-toones.com', 'onandasmilee.com', 'bonusandspins.com'];
-    const PLAYER_IFRAME_PATTERNS = ['pooembed.eu/embed-noads', 'pooembed.eu/embed'];
+    // Player iframes — never sandbox these regardless of host
+    const PLAYER_IFRAME_PATTERNS = [
+      'videasy.net', 'jwplayer', 'plyr', 'vidcloud', 'streamtape',
+      'mixdrop', 'doodstream', 'filemoon', 'voe.sx', 'upstream'
+    ];
     const SAFE_SANDBOX = 'allow-scripts allow-same-origin allow-forms allow-presentation';
 
     function handleIframe(iframe) {
@@ -609,7 +661,7 @@
     document.addEventListener('DOMContentLoaded', function () {
       document.querySelectorAll('iframe').forEach(handleIframe);
     });
-  }
+  } // end !isSafeHost block
 
   // -------------------------------------------------------------------------
   // 5. AIRPLAY CORE MODULE
